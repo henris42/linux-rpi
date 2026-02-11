@@ -38,7 +38,9 @@
 #include <linux/kconfig.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/namei.h>
+#include <linux/overflow.h>
 #include <linux/printk.h>
 #include <linux/ratelimit.h>
 #include <linux/slab.h>
@@ -119,6 +121,16 @@ static bool boot_certs_sha_ok;
 static bool boot_certs_sealed;
 static enum boot_certs_violation boot_certs_last_violation;
 static DEFINE_RATELIMIT_STATE(boot_certs_rs, HZ, 5);
+
+/*
+ * Protects all module state including chain_buf, bc_certs, and flags.
+ * Locking rules:
+ * - Init: No locking needed (single-threaded, before sysfs exposure)
+ * - Sysfs ops: Must hold mutex for duration of operation
+ * - Exit: Remove sysfs first (blocks until ops complete), then free under mutex
+ * - boot_certs_poisoned: Uses atomic ops, can be read without mutex
+ */
+static DEFINE_MUTEX(boot_certs_mutex);
 
 static struct kobject *boot_certs_kobj;
 
@@ -301,6 +313,14 @@ static int boot_certs_read_file_once(const char *path)
 		return -EFBIG;
 	}
 
+	/* Additional check: ensure size fits in size_t for safe cast */
+	if ((size_t)size != size || (size_t)size > SIZE_MAX) {
+		bc_dbg("file: size too large for platform: %lld\n", (long long)size);
+		filp_close(f, NULL);
+		boot_certs_poison(BC_V_FILE_SIZE);
+		return -EFBIG;
+	}
+
 	buf = kvmalloc((size_t)size, GFP_KERNEL);
 	if (!buf) {
 		bc_dbg("file: alloc failed (%lld bytes)\n", (long long)size);
@@ -362,6 +382,14 @@ static int boot_certs_read_cmdline(char **out_buf)
 		bc_dbg("cmdline: kernel_read failed (err=%zd)\n", n);
 		kfree(buf);
 		return (int)n;
+	}
+
+	/* Ensure we don't overflow buffer (n is guaranteed <= BOOT_CERTS_CMDLINE_MAX) */
+	if (n > BOOT_CERTS_CMDLINE_MAX) {
+		bc_dbg("cmdline: read size exceeds maximum (%zd > %u)\n",
+		       n, BOOT_CERTS_CMDLINE_MAX);
+		kfree(buf);
+		return -E2BIG;
 	}
 
 	buf[n] = '\0';
@@ -510,6 +538,9 @@ static int bc_asn1_get_tag_len(struct bc_asn1 *a, u8 *tag, size_t *len, const u8
 
 		l = 0;
 		for (i = 0; i < n; i++) {
+			/* Check for overflow before shift */
+			if (l > (SIZE_MAX >> 8))
+				return -EINVAL;
 			l = (l << 8) | p[i];
 		}
 		p += n;
@@ -746,7 +777,16 @@ static int bc_pem_extract_all(const u8 *pem, size_t pem_len)
 			return -EINVAL;
 		}
 
-		der_max = ((b64_clean_len + 3) / 4) * 3;
+		/* Check for potential overflow in size calculation */
+		if (check_mul_overflow((b64_clean_len + 3) / 4, 3UL, &der_max)) {
+#ifdef BOOT_CERTS_DEBUG
+			pr_info("boot_certs: pem: der_max calculation overflow (cert=%zu clean=%zu)\n",
+				count, b64_clean_len);
+#endif
+			kfree(b64_clean);
+			return -EINVAL;
+		}
+
 		if (der_max == 0 || der_max > BOOT_CERTS_MAX_BYTES) {
 #ifdef BOOT_CERTS_DEBUG
 			pr_info("boot_certs: pem: der_max invalid (cert=%zu der_max=%zu clean=%zu)\n",
@@ -855,30 +895,47 @@ static ssize_t chain_read(struct file *f, struct kobject *kobj,
 {
 	char path[sizeof(BOOT_CERTS_BOOT_PATH) + 1 + sizeof(BOOT_CERTS_CERT_REL)];
 	size_t avail;
+	ssize_t ret;
 
 	snprintf(path, sizeof(path), "%s/%s", BOOT_CERTS_BOOT_PATH, BOOT_CERTS_CERT_REL);
 
-	if (boot_certs_check_policy(path))
-		return -EACCES;
+	mutex_lock(&boot_certs_mutex);
 
-	if (!boot_certs_sha_ok)
-		return -EACCES;
+	if (boot_certs_check_policy(path)) {
+		ret = -EACCES;
+		goto out;
+	}
 
-	if (!chain_buf || !chain_len)
-		return -ENODATA;
+	if (!boot_certs_sha_ok) {
+		ret = -EACCES;
+		goto out;
+	}
 
-	if (off < 0)
-		return -EINVAL;
+	if (!chain_buf || !chain_len) {
+		ret = -ENODATA;
+		goto out;
+	}
 
-	if ((size_t)off >= chain_len)
-		return 0;
+	if (off < 0) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if ((size_t)off >= chain_len) {
+		ret = 0;
+		goto out;
+	}
 
 	avail = chain_len - (size_t)off;
 	if (cnt > avail)
 		cnt = avail;
 
 	memcpy(buf, (u8 *)chain_buf + off, cnt);
-	return (ssize_t)cnt;
+	ret = (ssize_t)cnt;
+
+out:
+	mutex_unlock(&boot_certs_mutex);
+	return ret;
 }
 
 static struct bin_attribute chain_attr = {
@@ -895,13 +952,25 @@ static struct bin_attribute chain_attr = {
 
 static ssize_t ok_show(struct kobject *k, struct kobj_attribute *a, char *b)
 {
-	return scnprintf(b, PAGE_SIZE, "%s\n", boot_certs_sha_ok ? "true" : "false");
+	ssize_t ret;
+
+	mutex_lock(&boot_certs_mutex);
+	ret = scnprintf(b, PAGE_SIZE, "%s\n", boot_certs_sha_ok ? "true" : "false");
+	mutex_unlock(&boot_certs_mutex);
+
+	return ret;
 }
 static struct kobj_attribute ok_attr = __ATTR_RO(ok);
 
 static ssize_t sealed_show(struct kobject *k, struct kobj_attribute *a, char *b)
 {
-	return scnprintf(b, PAGE_SIZE, "%s\n", boot_certs_sealed ? "true" : "false");
+	ssize_t ret;
+
+	mutex_lock(&boot_certs_mutex);
+	ret = scnprintf(b, PAGE_SIZE, "%s\n", boot_certs_sealed ? "true" : "false");
+	mutex_unlock(&boot_certs_mutex);
+
+	return ret;
 }
 
 #if IS_ENABLED(CONFIG_BOOT_CERTS_ALLOW_SYSFS_SEAL)
@@ -910,6 +979,7 @@ static ssize_t sealed_store(struct kobject *k, struct kobj_attribute *a,
 {
 	bool v;
 	int ret;
+	ssize_t result;
 
 	if (sysfs_streq(buf, "1") || sysfs_streq(buf, "true"))
 		v = true;
@@ -921,21 +991,32 @@ static ssize_t sealed_store(struct kobject *k, struct kobj_attribute *a,
 	if (!v)
 		return -EINVAL;
 
-	if (!boot_certs_sha_ok)
-		return -EACCES;
+	mutex_lock(&boot_certs_mutex);
 
-	if (boot_certs_sealed)
-		return count;
+	if (!boot_certs_sha_ok) {
+		result = -EACCES;
+		goto out;
+	}
+
+	if (boot_certs_sealed) {
+		result = count;
+		goto out;
+	}
 
 	ret = boot_certs_secondary_trusted_keys_seal();
 	if (ret) {
 		bc_dbg("seal: failed/unsupported (err=%d)\n", ret);
 		boot_certs_poison(BC_V_SEAL);
-		return ret;
+		result = ret;
+		goto out;
 	}
 
 	boot_certs_sealed = true;
-	return count;
+	result = count;
+
+out:
+	mutex_unlock(&boot_certs_mutex);
+	return result;
 }
 
 static struct kobj_attribute sealed_attr =
@@ -946,17 +1027,23 @@ static struct kobj_attribute sealed_attr = __ATTR_RO(sealed);
 
 static ssize_t status_show(struct kobject *k, struct kobj_attribute *a, char *b)
 {
-	return scnprintf(b, PAGE_SIZE,
-			 "poisoned=%d sha_ok=%d sealed=%d violation=%s size=%zu max=%u certs=%zu algo=%s boot=%s\n",
-			 atomic_read(&boot_certs_poisoned),
-			 boot_certs_sha_ok,
-			 boot_certs_sealed,
-			 boot_certs_violation_str(boot_certs_last_violation),
-			 chain_len,
-			 (unsigned)BOOT_CERTS_MAX_BYTES,
-			 bc_cert_count,
-			 BOOT_CERTS_DIGEST_NAME,
-			 BOOT_CERTS_BOOT_PATH);
+	ssize_t ret;
+
+	mutex_lock(&boot_certs_mutex);
+	ret = scnprintf(b, PAGE_SIZE,
+			"poisoned=%d sha_ok=%d sealed=%d violation=%s size=%zu max=%u certs=%zu algo=%s boot=%s\n",
+			atomic_read(&boot_certs_poisoned),
+			boot_certs_sha_ok,
+			boot_certs_sealed,
+			boot_certs_violation_str(boot_certs_last_violation),
+			chain_len,
+			(unsigned)BOOT_CERTS_MAX_BYTES,
+			bc_cert_count,
+			BOOT_CERTS_DIGEST_NAME,
+			BOOT_CERTS_BOOT_PATH);
+	mutex_unlock(&boot_certs_mutex);
+
+	return ret;
 }
 static struct kobj_attribute status_attr = __ATTR_RO(status);
 
@@ -1090,6 +1177,11 @@ out_fail:
 
 static void __exit boot_certs_exit(void)
 {
+	/*
+	 * Remove sysfs files first to prevent new accesses.
+	 * kobject_put() will wait for existing sysfs operations to complete
+	 * before returning, ensuring no use-after-free.
+	 */
 	if (boot_certs_kobj) {
 		sysfs_remove_bin_file(boot_certs_kobj, &chain_attr);
 		sysfs_remove_group(boot_certs_kobj, &attr_group);
@@ -1097,10 +1189,16 @@ static void __exit boot_certs_exit(void)
 		boot_certs_kobj = NULL;
 	}
 
+	/*
+	 * After sysfs cleanup, all operations are complete.
+	 * Safe to free resources under mutex protection.
+	 */
+	mutex_lock(&boot_certs_mutex);
 	bc_pem_free_all();
 	kvfree(chain_buf);
 	chain_buf = NULL;
 	chain_len = 0;
+	mutex_unlock(&boot_certs_mutex);
 }
 
 module_init(boot_certs_init);

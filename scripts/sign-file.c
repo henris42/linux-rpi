@@ -317,21 +317,21 @@ int main(int argc, char **argv)
 #ifndef USE_PKCS7
 		/* Load the signature message from the digest buffer. */
 		cms = CMS_sign(NULL, NULL, NULL, NULL,
-			       CMS_NOCERTS | CMS_PARTIAL | CMS_BINARY |
+			        CMS_PARTIAL | CMS_BINARY |
 			       CMS_DETACHED | CMS_STREAM);
 		ERR(!cms, "CMS_sign");
 
 		ERR(!CMS_add1_signer(cms, x509, private_key, digest_algo,
-				     CMS_NOCERTS | CMS_BINARY |
+				      CMS_BINARY |
 				     CMS_NOSMIMECAP | use_keyid |
 				     use_signed_attrs),
 		    "CMS_add1_signer");
-		ERR(CMS_final(cms, bm, NULL, CMS_NOCERTS | CMS_BINARY) != 1,
+		ERR(CMS_final(cms, bm, NULL,  CMS_BINARY) != 1,
 		    "CMS_final");
 
 #else
 		pkcs7 = PKCS7_sign(x509, private_key, NULL, bm,
-				   PKCS7_NOCERTS | PKCS7_BINARY |
+				    PKCS7_BINARY |
 				   PKCS7_DETACHED | use_signed_attrs);
 		ERR(!pkcs7, "PKCS7_sign");
 #endif

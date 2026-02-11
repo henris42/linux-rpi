@@ -10,10 +10,32 @@
 
 #include <linux/types.h>
 #include <linux/module_signature.h>
+#include <linux/init.h>
+#include <linux/kstrtox.h>
+#include <linux/verification.h>
 #include <keys/asymmetric-type.h>
 #include <crypto/pkcs7.h>
 
 #include "ima.h"
+
+/*
+ * Optional strict CA-chain policy for IMA modsig verification.
+ * Enable via kernel cmdline: ima.modsig_ca_enforce=1
+ */
+static bool ima_modsig_ca_enforce;
+
+static int __init ima_modsig_ca_enforce_setup(char *str)
+{
+	bool v;
+
+	if (!str)
+		return 0;
+	if (kstrtobool(str, &v))
+		return 0;
+	ima_modsig_ca_enforce = v;
+	return 1;
+}
+early_param("ima.modsig_ca_enforce", ima_modsig_ca_enforce_setup);
 
 struct modsig {
 	struct pkcs7_message *pkcs7_msg;
@@ -118,6 +140,17 @@ void ima_collect_modsig(struct modsig *modsig, const void *buf, loff_t size)
 
 int ima_modsig_verify(struct key *keyring, const struct modsig *modsig)
 {
+	unsigned int vflags = 0;
+
+	if (ima_modsig_ca_enforce)
+		vflags |= VERIFY_PKCS7_REQUIRE_CA_TRUST_ANCHOR |
+			  VERIFY_PKCS7_REJECT_SELF_SIGNED_SIGNER;
+
+	if (vflags)
+		return verify_pkcs7_message_sig_ext(NULL, 0, modsig->pkcs7_msg, keyring,
+						    VERIFYING_MODULE_SIGNATURE,
+						    vflags, NULL, NULL);
+
 	return verify_pkcs7_message_sig(NULL, 0, modsig->pkcs7_msg, keyring,
 					VERIFYING_MODULE_SIGNATURE, NULL, NULL);
 }

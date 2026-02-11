@@ -12,6 +12,8 @@
 #include <linux/string.h>
 #include <linux/verification.h>
 #include <linux/security.h>
+#include <linux/init.h>
+#include <linux/kstrtox.h>
 #include <crypto/public_key.h>
 #include <uapi/linux/module.h>
 #include "internal.h"
@@ -21,6 +23,25 @@
 
 static bool sig_enforce = IS_ENABLED(CONFIG_MODULE_SIG_FORCE);
 module_param(sig_enforce, bool_enable_only, 0644);
+
+/*
+ * Optional strict CA-chain policy for module signatures.
+ * Enable via kernel cmdline: module.sig_ca_enforce=1
+ */
+static bool sig_ca_enforce;
+
+static int __init module_sig_ca_enforce_setup(char *str)
+{
+	bool v;
+
+	if (!str)
+		return 0;
+	if (kstrtobool(str, &v))
+		return 0;
+	sig_ca_enforce = v;
+	return 1;
+}
+early_param("module.sig_ca_enforce", module_sig_ca_enforce_setup);
 
 /*
  * Export sig_enforce kernel cmdline parameter to allow other subsystems rely
@@ -44,6 +65,7 @@ int mod_verify_sig(const void *mod, struct load_info *info)
 {
 	struct module_signature ms;
 	size_t sig_len, modlen = info->len;
+	unsigned int vflags = 0;
 	int ret;
 
 	pr_devel("==>%s(,%zu)\n", __func__, modlen);
@@ -60,6 +82,16 @@ int mod_verify_sig(const void *mod, struct load_info *info)
 	sig_len = be32_to_cpu(ms.sig_len);
 	modlen -= sig_len + sizeof(ms);
 	info->len = modlen;
+
+	if (sig_ca_enforce)
+		vflags |= VERIFY_PKCS7_REQUIRE_CA_TRUST_ANCHOR |
+			  VERIFY_PKCS7_REJECT_SELF_SIGNED_SIGNER;
+
+	if (vflags)
+		return verify_pkcs7_signature_ext(mod, modlen, mod + modlen, sig_len,
+						  VERIFY_USE_SECONDARY_KEYRING,
+						  VERIFYING_MODULE_SIGNATURE,
+						  vflags, NULL, NULL);
 
 	return verify_pkcs7_signature(mod, modlen, mod + modlen, sig_len,
 				      VERIFY_USE_SECONDARY_KEYRING,

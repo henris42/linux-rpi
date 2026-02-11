@@ -13,6 +13,8 @@
 #include <linux/slab.h>
 #include <linux/uidgid.h>
 #include <linux/verification.h>
+#include <linux/init.h>
+#include <linux/kstrtox.h>
 #include "secondary_trusted_keys.h"
 #include <keys/asymmetric-type.h>
 #include <keys/system_keyring.h>
@@ -32,6 +34,92 @@ static struct key *platform_trusted_keys;
 extern __initconst const u8 system_certificate_list[];
 extern __initconst const unsigned long system_certificate_list_size;
 extern __initconst const unsigned long module_cert_size;
+
+
+/* Debug instrumentation for PKCS#7 verification path.
+ * Enable via kernel cmdline: system_keyring.pkcs7_debug=1
+ * Optionally increase verbosity: system_keyring.pkcs7_debug_verbose=1
+ */
+static bool pkcs7_debug;
+static bool pkcs7_debug_verbose;
+
+static int __init system_keyring_pkcs7_debug_setup(char *str)
+{
+	bool v;
+
+	if (!str)
+		return 0;
+	if (kstrtobool(str, &v))
+		return 0;
+	pkcs7_debug = v;
+	return 1;
+}
+early_param("system_keyring.pkcs7_debug", system_keyring_pkcs7_debug_setup);
+
+static int __init system_keyring_pkcs7_debug_verbose_setup(char *str)
+{
+	bool v;
+
+	if (!str)
+		return 0;
+	if (kstrtobool(str, &v))
+		return 0;
+	pkcs7_debug_verbose = v;
+	return 1;
+}
+early_param("system_keyring.pkcs7_debug_verbose", system_keyring_pkcs7_debug_verbose_setup);
+
+static const char *keyring_name(struct key *k)
+{
+	if (k == builtin_trusted_keys)
+		return "builtin";
+#ifdef CONFIG_SECONDARY_TRUSTED_KEYRING
+	if (k == secondary_trusted_keys)
+		return "secondary";
+#endif
+#ifdef CONFIG_INTEGRITY_PLATFORM_KEYRING
+	if (k == platform_trusted_keys)
+		return "platform";
+#endif
+#ifdef CONFIG_INTEGRITY_MACHINE_KEYRING
+	if (k == machine_trusted_keys)
+		return "machine";
+#endif
+	return "other";
+}
+
+static void pkcs7dbg_log_keyring_sel(struct key *orig, struct key *sel)
+{
+	if (!pkcs7_debug)
+		return;
+
+	pr_notice("PKCS7DBG: trusted_keys arg=%p selected=%p(%s)%s\n",
+		  orig, sel, keyring_name(sel),
+		  sel ? "" : " [NULL]");
+	if (pkcs7_debug_verbose && sel)
+		pr_notice("PKCS7DBG: selected keyring serial=%d desc='%s'\n",
+			  sel->serial, sel->description ? sel->description : "?");
+}
+
+static void pkcs7dbg_log_rc(const char *stage, int rc)
+{
+	if (!pkcs7_debug)
+		return;
+
+	pr_notice("PKCS7DBG: %s -> %d\n", stage, rc);
+}
+
+static void pkcs7dbg_log_usage_flags(enum key_being_used_for usage,
+				     unsigned int flags,
+				     const void *data, size_t len,
+				     const void *pkcs7)
+{
+	if (!pkcs7_debug)
+		return;
+
+	pr_notice("PKCS7DBG: enter usage=%s(%d) flags=0x%x data=%p len=%zu pkcs7=%p\n",
+		  key_being_used_for[usage], usage, flags, data, len, pkcs7);
+}
 
 /**
  * restrict_link_by_builtin_trusted - Restrict keyring addition by built-in CA
@@ -404,6 +492,121 @@ late_initcall(load_system_certificate_list);
  * @view_content: Callback to gain access to content.
  * @ctx: Context for callback.
  */
+
+static int __verify_pkcs7_message_sig(const void *data, size_t len,
+				      struct pkcs7_message *pkcs7,
+				      struct key *trusted_keys,
+				      enum key_being_used_for usage,
+				      unsigned int flags,
+				      int (*view_content)(void *ctx,
+							  const void *data, size_t len,
+							  size_t asn1hdrlen),
+				      void *ctx)
+{
+	int ret;
+	struct key *selected = trusted_keys;
+
+	pkcs7dbg_log_usage_flags(usage, flags, data, len, pkcs7);
+
+	/* The data should be detached - so we need to supply it. */
+	if (data && pkcs7_supply_detached_data(pkcs7, data, len) < 0) {
+		pr_err("PKCS#7 signature with non-detached data\n");
+		ret = -EBADMSG;
+		pkcs7dbg_log_rc("pkcs7_supply_detached_data", ret);
+		goto error;
+	}
+
+	ret = pkcs7_verify(pkcs7, usage);
+	pkcs7dbg_log_rc("pkcs7_verify", ret);
+	if (ret < 0)
+		goto error;
+
+	ret = is_key_on_revocation_list(pkcs7);
+	pkcs7dbg_log_rc("is_key_on_revocation_list", ret);
+	if (ret != -ENOKEY) {
+		pr_devel("PKCS#7 key is on revocation list\n");
+		goto error;
+	}
+
+	if (!trusted_keys) {
+		selected = builtin_trusted_keys;
+	} else if (trusted_keys == VERIFY_USE_SECONDARY_KEYRING) {
+#ifdef CONFIG_SECONDARY_TRUSTED_KEYRING
+		selected = secondary_trusted_keys;
+#else
+		selected = builtin_trusted_keys;
+#endif
+	} else if (trusted_keys == VERIFY_USE_PLATFORM_KEYRING) {
+#ifdef CONFIG_INTEGRITY_PLATFORM_KEYRING
+		selected = platform_trusted_keys;
+#else
+		selected = NULL;
+#endif
+		if (!selected) {
+			ret = -ENOKEY;
+			pr_devel("PKCS#7 platform keyring is not available\n");
+			pkcs7dbg_log_rc("select_platform_keyring", ret);
+			goto error;
+		}
+	} else {
+		selected = trusted_keys;
+	}
+
+	pkcs7dbg_log_keyring_sel(trusted_keys, selected);
+
+	ret = pkcs7_validate_trust_ext(pkcs7, selected, flags);
+	pkcs7dbg_log_rc("pkcs7_validate_trust_ext", ret);
+
+	if (ret < 0) {
+		if (ret == -ENOKEY)
+			pr_devel("PKCS#7 signature not signed with a trusted key\n");
+		goto error;
+	}
+
+	if (view_content) {
+		size_t asn1hdrlen;
+		const void *cdata = NULL;
+		size_t clen = 0;
+
+		ret = pkcs7_get_content_data(pkcs7, &cdata, &clen, &asn1hdrlen);
+		pkcs7dbg_log_rc("pkcs7_get_content_data", ret);
+		if (pkcs7_debug && pkcs7_debug_verbose && ret == 0)
+			pr_notice("PKCS7DBG: content len=%zu asn1hdrlen=%zu\n",
+				  clen, asn1hdrlen);
+
+		if (ret < 0) {
+			if (ret == -ENODATA)
+				pr_devel("PKCS#7 message does not contain data\n");
+			goto error;
+		}
+
+		ret = view_content(ctx, cdata, clen, asn1hdrlen);
+		pkcs7dbg_log_rc("view_content", ret);
+	}
+
+error:
+	if (pkcs7_debug)
+		pr_notice("PKCS7DBG: exit ret=%d usage=%s flags=0x%x\n",
+			  ret, key_being_used_for[usage], flags);
+	pr_devel("<==%s() = %d\n", __func__, ret);
+	return ret;
+}
+
+int verify_pkcs7_message_sig_ext(const void *data, size_t len,
+				 struct pkcs7_message *pkcs7,
+				 struct key *trusted_keys,
+				 enum key_being_used_for usage,
+				 unsigned int flags,
+				 int (*view_content)(void *ctx,
+						     const void *data, size_t len,
+						     size_t asn1hdrlen),
+				 void *ctx)
+{
+	return __verify_pkcs7_message_sig(data, len, pkcs7, trusted_keys, usage,
+					  flags, view_content, ctx);
+}
+EXPORT_SYMBOL_GPL(verify_pkcs7_message_sig_ext);
+
 int verify_pkcs7_message_sig(const void *data, size_t len,
 			     struct pkcs7_message *pkcs7,
 			     struct key *trusted_keys,
@@ -413,68 +616,8 @@ int verify_pkcs7_message_sig(const void *data, size_t len,
 						 size_t asn1hdrlen),
 			     void *ctx)
 {
-	int ret;
-
-	/* The data should be detached - so we need to supply it. */
-	if (data && pkcs7_supply_detached_data(pkcs7, data, len) < 0) {
-		pr_err("PKCS#7 signature with non-detached data\n");
-		ret = -EBADMSG;
-		goto error;
-	}
-
-	ret = pkcs7_verify(pkcs7, usage);
-	if (ret < 0)
-		goto error;
-
-	ret = is_key_on_revocation_list(pkcs7);
-	if (ret != -ENOKEY) {
-		pr_devel("PKCS#7 key is on revocation list\n");
-		goto error;
-	}
-
-	if (!trusted_keys) {
-		trusted_keys = builtin_trusted_keys;
-	} else if (trusted_keys == VERIFY_USE_SECONDARY_KEYRING) {
-#ifdef CONFIG_SECONDARY_TRUSTED_KEYRING
-		trusted_keys = secondary_trusted_keys;
-#else
-		trusted_keys = builtin_trusted_keys;
-#endif
-	} else if (trusted_keys == VERIFY_USE_PLATFORM_KEYRING) {
-#ifdef CONFIG_INTEGRITY_PLATFORM_KEYRING
-		trusted_keys = platform_trusted_keys;
-#else
-		trusted_keys = NULL;
-#endif
-		if (!trusted_keys) {
-			ret = -ENOKEY;
-			pr_devel("PKCS#7 platform keyring is not available\n");
-			goto error;
-		}
-	}
-	ret = pkcs7_validate_trust(pkcs7, trusted_keys);
-	if (ret < 0) {
-		if (ret == -ENOKEY)
-			pr_devel("PKCS#7 signature not signed with a trusted key\n");
-		goto error;
-	}
-
-	if (view_content) {
-		size_t asn1hdrlen;
-
-		ret = pkcs7_get_content_data(pkcs7, &data, &len, &asn1hdrlen);
-		if (ret < 0) {
-			if (ret == -ENODATA)
-				pr_devel("PKCS#7 message does not contain data\n");
-			goto error;
-		}
-
-		ret = view_content(ctx, data, len, asn1hdrlen);
-	}
-
-error:
-	pr_devel("<==%s() = %d\n", __func__, ret);
-	return ret;
+	return __verify_pkcs7_message_sig(data, len, pkcs7, trusted_keys, usage,
+					  0, view_content, ctx);
 }
 
 /**
@@ -505,14 +648,39 @@ int verify_pkcs7_signature(const void *data, size_t len,
 	if (IS_ERR(pkcs7))
 		return PTR_ERR(pkcs7);
 
-	ret = verify_pkcs7_message_sig(data, len, pkcs7, trusted_keys, usage,
-				       view_content, ctx);
+	ret = __verify_pkcs7_message_sig(data, len, pkcs7, trusted_keys, usage,
+					 0, view_content, ctx);
 
 	pkcs7_free_message(pkcs7);
 	pr_devel("<==%s() = %d\n", __func__, ret);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(verify_pkcs7_signature);
+
+int verify_pkcs7_signature_ext(const void *data, size_t len,
+			       const void *raw_pkcs7, size_t pkcs7_len,
+			       struct key *trusted_keys,
+			       enum key_being_used_for usage,
+			       unsigned int flags,
+			       int (*view_content)(void *ctx,
+						   const void *data, size_t len,
+						   size_t asn1hdrlen),
+			       void *ctx)
+{
+	struct pkcs7_message *pkcs7;
+	int ret;
+
+	pkcs7 = pkcs7_parse_message(raw_pkcs7, pkcs7_len);
+	if (IS_ERR(pkcs7))
+		return PTR_ERR(pkcs7);
+
+	ret = __verify_pkcs7_message_sig(data, len, pkcs7, trusted_keys, usage,
+					 flags, view_content, ctx);
+
+	pkcs7_free_message(pkcs7);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(verify_pkcs7_signature_ext);
 
 #endif /* CONFIG_SYSTEM_DATA_VERIFICATION */
 
