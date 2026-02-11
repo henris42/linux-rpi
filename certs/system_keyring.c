@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #include <linux/uidgid.h>
 #include <linux/verification.h>
+#include "secondary_trusted_keys.h"
 #include <keys/asymmetric-type.h>
 #include <keys/system_keyring.h>
 #include <crypto/pkcs7.h>
@@ -136,6 +137,7 @@ int restrict_link_by_digsig_builtin_and_secondary(struct key *dest_keyring,
  * Allocate a struct key_restriction for the "builtin and secondary trust"
  * keyring. Only for use in system_trusted_keyring_init().
  */
+#if !IS_ENABLED(CONFIG_BOOT_CERTS_SYSFS)
 static __init struct key_restriction *get_builtin_and_secondary_restriction(void)
 {
 	struct key_restriction *restriction;
@@ -152,6 +154,7 @@ static __init struct key_restriction *get_builtin_and_secondary_restriction(void
 
 	return restriction;
 }
+#endif
 
 /**
  * add_to_secondary_keyring - Add to secondary keyring.
@@ -182,6 +185,94 @@ void __init add_to_secondary_keyring(const char *source, const void *data, size_
 	pr_notice("Loaded X.509 cert '%s'\n", key_ref_to_ptr(key)->description);
 	key_ref_put(key);
 }
+
+/*
+ * Add a DER-encoded X.509 certificate to .secondary_trusted_keys
+ * as an "asymmetric" key. The asymmetric preparse will validate
+ * and create the key if acceptable.
+ */
+int secondary_trusted_keys_add_cert(const void *der, size_t der_len,
+				   const char *desc)
+{
+	key_ref_t keyring_ref;
+	key_ref_t key_ref;
+
+	if (!secondary_trusted_keys)
+		return -ENOKEY;
+	if (!der || der_len == 0 || !desc)
+		return -EINVAL;
+
+	keyring_ref = make_key_ref(secondary_trusted_keys, 1);
+
+	key_ref = key_create_or_update(keyring_ref,
+				       "asymmetric",
+				       desc,
+				       der,
+				       der_len,
+				       KEY_POS_ALL | KEY_USR_VIEW,
+				       KEY_ALLOC_NOT_IN_QUOTA);
+	if (IS_ERR(key_ref))
+		return PTR_ERR(key_ref);
+
+	/* Drop the ref we got back. */
+	key_ref_put(key_ref);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(secondary_trusted_keys_add_cert);
+/*
+ * Deny linking any key into the destination keyring.
+ * Prototype comes from key_restrict_link_func_t (check include/linux/key-type.h).
+ */
+static int restrict_link_deny(struct key *dest_keyring,
+			      const struct key_type *type,
+			      const union key_payload *payload,
+			      struct key *trust_keyring)
+{
+	return -EACCES;
+}
+
+static const struct key_restriction secondary_trusted_keys_deny_restrict = {
+	.check = restrict_link_deny,
+};
+
+int secondary_trusted_keys_seal(void)
+{
+#if !IS_ENABLED(CONFIG_BOOT_CERTS_SYSFS)
+	return -EOPNOTSUPP;
+#else
+	key_ref_t keyring_ref;
+	char restr[64];
+	int ret;
+
+	if (!secondary_trusted_keys)
+		return -ENOKEY;
+
+	keyring_ref = make_key_ref(secondary_trusted_keys, 1);
+
+	/* Try self-contained restriction if supported by this tree */
+	snprintf(restr, sizeof(restr), "key_or_keyring:%u",
+		 secondary_trusted_keys->serial);
+
+	ret = keyring_restrict(keyring_ref, "asymmetric", restr);
+	if (ret == 0 || ret == -EEXIST)
+		return 0;
+
+	/*
+	 * If the kernel doesn't understand the restriction string,
+	 * don't fail boot/module loading. Keep it unsealed (policy-only)
+	 * and rely on your boot_certs module’s own gating for now.
+	 */
+	if (ret == -EINVAL) {
+		pr_warn("secondary_trusted_keys: seal restriction '%s' unsupported; leaving keyring unrestricted\n",
+			restr);
+		return 0;
+	}
+
+	return ret;
+#endif
+}
+EXPORT_SYMBOL_GPL(secondary_trusted_keys_seal);
+
 #endif
 #ifdef CONFIG_INTEGRITY_MACHINE_KEYRING
 void __init set_machine_trusted_keys(struct key *keyring)
@@ -238,20 +329,25 @@ static __init int system_trusted_keyring_init(void)
 		panic("Can't allocate builtin trusted keyring\n");
 
 #ifdef CONFIG_SECONDARY_TRUSTED_KEYRING
-	secondary_trusted_keys =
-		keyring_alloc(".secondary_trusted_keys",
-			      GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, current_cred(),
-			      ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
-			       KEY_USR_VIEW | KEY_USR_READ | KEY_USR_SEARCH |
-			       KEY_USR_WRITE),
-			      KEY_ALLOC_NOT_IN_QUOTA,
-			      get_builtin_and_secondary_restriction(),
-			      NULL);
+secondary_trusted_keys =
+	keyring_alloc(".secondary_trusted_keys",
+		      GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, current_cred(),
+		      ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
+		       KEY_USR_VIEW | KEY_USR_READ | KEY_USR_SEARCH |
+		       KEY_USR_WRITE),
+		      KEY_ALLOC_NOT_IN_QUOTA,
+#if IS_ENABLED(CONFIG_BOOT_CERTS_SYSFS)
+		      NULL,   /* boot_certs will populate + seal */
+#else
+		      get_builtin_and_secondary_restriction(),
+#endif
+		      NULL);
 	if (IS_ERR(secondary_trusted_keys))
 		panic("Can't allocate secondary trusted keyring\n");
 
 	if (key_link(secondary_trusted_keys, builtin_trusted_keys) < 0)
 		panic("Can't link trusted keyrings\n");
+
 #endif
 
 	return 0;

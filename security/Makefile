@@ -29,3 +29,6 @@ obj-$(CONFIG_SECURITY_IPE)		+= ipe/
 
 # Object integrity file lists
 obj-$(CONFIG_INTEGRITY)			+= integrity/
+
+# Boot certificates via sysfs
+obj-$(CONFIG_BOOT_CERTS_SYSFS)		+= boot_certs/

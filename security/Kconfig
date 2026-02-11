@@ -281,5 +281,7 @@ config LSM
 
 source "security/Kconfig.hardening"
 
+source "security/boot_certs/Kconfig"
+
 endmenu
 

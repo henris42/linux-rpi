@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config BOOT_CERTS_SYSFS
+	tristate "Expose verified boot cert chain via sysfs"
+	depends on SYSFS
+	depends on KEYS
+	select CRYPTO
+	select CRYPTO_HASH
+	select CRYPTO_SHA3
+	select BASE64
+	help
+	  ...
+
+config BOOT_CERTS_SEAL_AT_BOOT
+	bool "Seal .secondary_trusted_keys at boot"
+	depends on BOOT_CERTS_SYSFS
+	depends on SECONDARY_TRUSTED_KEYRING
+	default y
+
+config BOOT_CERTS_ALLOW_SYSFS_SEAL
+	bool "Allow one-way sealing via /sys/kernel/boot_certs/sealed"
+	depends on BOOT_CERTS_SYSFS
+	depends on SECONDARY_TRUSTED_KEYRING
+	default y
+
+config BOOT_CERTS_MAX_BYTES
+	int "Max bytes for chain.pem"
+	depends on BOOT_CERTS_SYSFS
+	range 4096 1048576
+	default 262144
+	help
+	  Maximum size of the PEM bundle read from <boot>/certs/chain.pem.
+
