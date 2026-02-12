@@ -132,6 +132,15 @@ software_key_determine_akcipher(const struct public_key *pkey,
 		if (strcmp(hash_algo, "streebog256") != 0 &&
 		    strcmp(hash_algo, "streebog512") != 0)
 			return -EINVAL;
+#ifdef CONFIG_CRYPTO_FALCON
+	} else if (strncmp(pkey->pkey_algo, "falcon-", 7) == 0) {
+		/*
+		 * FALCON does its own internal hashing (SHAKE256).
+		 * No pre-hash is required - raw TBS data is passed directly.
+		 */
+		if (strcmp(encoding, "raw") != 0)
+			return -EINVAL;
+#endif
 	} else {
 		/* Unknown public key algorithm */
 		return -ENOPKG;

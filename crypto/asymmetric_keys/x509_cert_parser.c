@@ -257,6 +257,20 @@ int x509_note_sig_algo(void *context, size_t hdrlen, unsigned char tag,
 	case OID_gost2012Signature512:
 		ctx->cert->sig->hash_algo = "streebog512";
 		goto ecrdsa;
+
+#ifdef CONFIG_CRYPTO_FALCON
+	case OID_falcon512:
+	case OID_falcon_padded512:
+		ctx->cert->sig->hash_algo = NULL;
+		ctx->cert->sig->pkey_algo = "falcon-512";
+		goto falcon;
+
+	case OID_falcon1024:
+	case OID_falcon_padded1024:
+		ctx->cert->sig->hash_algo = NULL;
+		ctx->cert->sig->pkey_algo = "falcon-1024";
+		goto falcon;
+#endif
 	}
 
 rsa_pkcs1:
@@ -274,6 +288,13 @@ ecdsa:
 	ctx->cert->sig->encoding = "x962";
 	ctx->sig_algo = ctx->last_oid;
 	return 0;
+#ifdef CONFIG_CRYPTO_FALCON
+falcon:
+	/* FALCON does its own internal hashing (SHAKE256) - no pre-hash */
+	ctx->cert->sig->encoding = "raw";
+	ctx->sig_algo = ctx->last_oid;
+	return 0;
+#endif
 }
 
 /*
@@ -300,7 +321,8 @@ int x509_note_signature(void *context, size_t hdrlen,
 
 	if (strcmp(ctx->cert->sig->pkey_algo, "rsa") == 0 ||
 	    strcmp(ctx->cert->sig->pkey_algo, "ecrdsa") == 0 ||
-	    strcmp(ctx->cert->sig->pkey_algo, "ecdsa") == 0) {
+	    strcmp(ctx->cert->sig->pkey_algo, "ecdsa") == 0 ||
+	    strncmp(ctx->cert->sig->pkey_algo, "falcon-", 7) == 0) {
 		/* Discard the BIT STRING metadata */
 		if (vlen < 1 || *(const u8 *)value != 0)
 			return -EBADMSG;
@@ -525,6 +547,16 @@ int x509_extract_key_data(void *context, size_t hdrlen,
 			return -ENOPKG;
 		}
 		break;
+#ifdef CONFIG_CRYPTO_FALCON
+	case OID_falcon512:
+	case OID_falcon_padded512:
+		ctx->cert->pub->pkey_algo = "falcon-512";
+		break;
+	case OID_falcon1024:
+	case OID_falcon_padded1024:
+		ctx->cert->pub->pkey_algo = "falcon-1024";
+		break;
+#endif
 	default:
 		return -ENOPKG;
 	}

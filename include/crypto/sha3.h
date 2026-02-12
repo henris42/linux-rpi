@@ -31,4 +31,7 @@ int crypto_sha3_update(struct shash_desc *desc, const u8 *data,
 		       unsigned int len);
 int crypto_sha3_final(struct shash_desc *desc, u8 *out);
 
+/* Keccak permutation (for SHAKE256 XOF) */
+void crypto_sha3_permute(u64 *state);
+
 #endif

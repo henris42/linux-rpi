@@ -28,14 +28,32 @@ static int pkcs7_digest(struct pkcs7_message *pkcs7,
 	size_t desc_size;
 	int ret;
 
-	kenter(",%u,%s", sinfo->index, sinfo->sig->hash_algo);
+	kenter(",%u,%s", sinfo->index,
+	       sinfo->sig->hash_algo ?: "(internal)");
 
 	/* The digest was calculated already. */
 	if (sig->digest)
 		return 0;
 
-	if (!sinfo->sig->hash_algo)
-		return -ENOPKG;
+	/*
+	 * FALCON and other PQC algorithms do their own internal hashing.
+	 * No pre-hash needed - pass raw content data as the "digest".
+	 * Note: PKCS#7 with PQC is non-standard; authenticated attributes
+	 * are not supported for algorithms without a separate digest.
+	 */
+	if (!sinfo->sig->hash_algo) {
+		if (sinfo->authattrs) {
+			pr_warn("Sig %u: PQC algorithm with authattrs not supported\n",
+				sinfo->index);
+			return -ENOPKG;
+		}
+		sig->digest = kmemdup(pkcs7->data, pkcs7->data_len,
+				      GFP_KERNEL);
+		if (!sig->digest)
+			return -ENOMEM;
+		sig->digest_size = pkcs7->data_len;
+		return 0;
+	}
 
 	/* Allocate the hashing algorithm we're going to need and find out how
 	 * big the hash operational data will be.
@@ -141,10 +159,12 @@ int pkcs7_get_digest(struct pkcs7_message *pkcs7, const u8 **buf, u32 *len,
 	*buf = sinfo->sig->digest;
 	*len = sinfo->sig->digest_size;
 
-	i = match_string(hash_algo_name, HASH_ALGO__LAST,
-			 sinfo->sig->hash_algo);
-	if (i >= 0)
-		*hash_algo = i;
+	if (sinfo->sig->hash_algo) {
+		i = match_string(hash_algo_name, HASH_ALGO__LAST,
+				 sinfo->sig->hash_algo);
+		if (i >= 0)
+			*hash_algo = i;
+	}
 
 	return 0;
 }

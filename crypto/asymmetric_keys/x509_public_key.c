@@ -37,6 +37,18 @@ int x509_get_sig_params(struct x509_certificate *cert)
 
 	sig->s_size = cert->raw_sig_size;
 
+	/*
+	 * FALCON and other PQC algorithms do their own internal hashing.
+	 * No pre-hash needed - pass raw TBS data as the "digest".
+	 */
+	if (!sig->hash_algo) {
+		sig->digest = kmemdup(cert->tbs, cert->tbs_size, GFP_KERNEL);
+		if (!sig->digest)
+			return -ENOMEM;
+		sig->digest_size = cert->tbs_size;
+		return 0;
+	}
+
 	/* Allocate the hashing algorithm we're going to need and find out how
 	 * big the hash operational data will be.
 	 */
@@ -170,7 +182,8 @@ static int x509_key_preparse(struct key_preparsed_payload *prep)
 		cert->sig = NULL;
 	} else {
 		pr_devel("Cert Signature: %s + %s\n",
-			 cert->sig->pkey_algo, cert->sig->hash_algo);
+			 cert->sig->pkey_algo,
+			 cert->sig->hash_algo ?: "(internal)");
 	}
 
 	/* Don't permit addition of blacklisted keys */

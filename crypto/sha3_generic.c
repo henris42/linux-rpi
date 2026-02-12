@@ -158,6 +158,16 @@ static void keccakf(u64 st[25])
 	}
 }
 
+/*
+ * Export Keccak permutation for SHAKE256 (used by FALCON PQC)
+ * SHAKE256 needs direct access to the permutation for XOF squeezing
+ */
+void crypto_sha3_permute(u64 *state)
+{
+	keccakf(state);
+}
+EXPORT_SYMBOL_GPL(crypto_sha3_permute);
+
 int crypto_sha3_init(struct shash_desc *desc)
 {
 	struct sha3_state *sctx = shash_desc_ctx(desc);

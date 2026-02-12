@@ -1,0 +1,27 @@
+config CRYPTO_FALCON
+	bool "FALCON post-quantum signature verification"
+	select CRYPTO_HASH
+	select CRYPTO_SHA256
+	help
+	  FALCON (Fast-Fourier Lattice-based Compact Signatures over NTRU)
+	  is a post-quantum cryptographic signature scheme selected by NIST
+	  for standardization as FIPS 206 (FN-DSA).
+
+	  This provides SIGNATURE VERIFICATION ONLY. Signing and key
+	  generation must be done in userspace.
+
+	  Supports:
+	  - FALCON-512 (NIST security level 1, ~AES-128)
+	  - FALCON-1024 (NIST security level 5, ~AES-256)
+
+	  Required for:
+	  - Boot certificate validation (early boot)
+	  - Kernel module signature verification
+	  - X.509 certificate verification with FALCON keys
+	  - PKCS#7 signature verification
+	  - IMA/EVM integrity measurement
+
+	  This must be built-in (not a module) because it's needed for
+	  module signature verification and early boot certificate validation.
+
+	  If unsure, say Y.

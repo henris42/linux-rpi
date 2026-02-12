@@ -297,6 +297,20 @@ int pkcs7_sig_note_pkey_algo(void *context, size_t hdrlen,
 		ctx->sinfo->sig->pkey_algo = "ecrdsa";
 		ctx->sinfo->sig->encoding = "raw";
 		break;
+#ifdef CONFIG_CRYPTO_FALCON
+	case OID_falcon512:
+	case OID_falcon_padded512:
+		ctx->sinfo->sig->pkey_algo = "falcon-512";
+		ctx->sinfo->sig->encoding = "raw";
+		ctx->sinfo->sig->hash_algo = NULL; /* internal SHAKE256 */
+		break;
+	case OID_falcon1024:
+	case OID_falcon_padded1024:
+		ctx->sinfo->sig->pkey_algo = "falcon-1024";
+		ctx->sinfo->sig->encoding = "raw";
+		ctx->sinfo->sig->hash_algo = NULL; /* internal SHAKE256 */
+		break;
+#endif
 	default:
 		printk("Unsupported pkey algo: %u\n", ctx->last_oid);
 		return -ENOPKG;

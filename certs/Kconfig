@@ -39,6 +39,25 @@ config MODULE_SIG_KEY_TYPE_ECDSA
 	 Note: Remove all ECDSA signing keys, e.g. certs/signing_key.pem,
 	 when falling back to building Linux 5.14 and older kernels.
 
+config MODULE_SIG_KEY_TYPE_FALCON
+	bool "FALCON (post-quantum)"
+	depends on CRYPTO_FALCON
+	help
+	 Use a FALCON post-quantum key for module signing. FALCON
+	 (Fast-Fourier Lattice-based Compact Signatures over NTRU) is a
+	 NIST-selected post-quantum signature algorithm (FIPS 206 / FN-DSA).
+
+	 The host signing tool (scripts/sign-file) requires OpenSSL 3.x
+	 with the oqs-provider for FALCON key and CMS support.
+	 Alternatively, use sign-file -s with a pre-generated PKCS#7/CMS
+	 signature from an external tool.
+
+	 FALCON handles hashing internally (SHAKE256), so the hash
+	 algorithm selection is ignored when signing with a FALCON key.
+
+	 Note: FALCON OIDs are experimental (OQS/Open Quantum Safe).
+	 Update when NIST assigns final OIDs for FN-DSA (FIPS 206).
+
 endchoice
 
 config SYSTEM_TRUSTED_KEYRING

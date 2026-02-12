@@ -43,9 +43,18 @@ targets += x509_certificate_list
 ifeq ($(CONFIG_MODULE_SIG_KEY),certs/signing_key.pem)
 
 keytype-$(CONFIG_MODULE_SIG_KEY_TYPE_ECDSA) := -newkey ec -pkeyopt ec_paramgen_curve:secp384r1
+keytype-$(CONFIG_MODULE_SIG_KEY_TYPE_FALCON) := -newkey falcon512
+
+# FALCON and other PQC algorithms handle hashing internally;
+# skip the digest flag for key generation when using PQC keys.
+ifdef CONFIG_MODULE_SIG_KEY_TYPE_FALCON
+gen-hash-flag :=
+else
+gen-hash-flag := -$(CONFIG_MODULE_SIG_HASH)
+endif
 
 quiet_cmd_gen_key = GENKEY  $@
-      cmd_gen_key = openssl req -new -nodes -utf8 -$(CONFIG_MODULE_SIG_HASH) -days 36500 \
+      cmd_gen_key = openssl req -new -nodes -utf8 $(gen-hash-flag) -days 36500 \
 		-batch -x509 -config $< \
 		-outform PEM -out $@ -keyout $@ $(keytype-y) 2>&1
 

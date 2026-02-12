@@ -313,6 +313,8 @@ config CRYPTO_ECRDSA
 	  One of the Russian cryptographic standard algorithms (called GOST
 	  algorithms). Only signature verification is implemented.
 
+source "crypto/falcon/Kconfig"
+
 config CRYPTO_CURVE25519
 	tristate "Curve25519"
 	select CRYPTO_KPP

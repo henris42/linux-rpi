@@ -134,6 +134,19 @@ enum OID {
 	OID_TPMImportableKey,		/* 2.23.133.10.1.4 */
 	OID_TPMSealedData,		/* 2.23.133.10.1.5 */
 
+	/*
+	 * FALCON post-quantum signature (OQS experimental OIDs)
+	 * These OIDs are NOT yet standardized by NIST.
+	 * Final OIDs will be assigned when FIPS 206 (FN-DSA) is published.
+	 * Update these when NIST assigns final OIDs.
+	 */
+#ifdef CONFIG_CRYPTO_FALCON
+	OID_falcon512,				/* 1.3.9999.3.6 */
+	OID_falcon1024,				/* 1.3.9999.3.8 */
+	OID_falcon_padded512,			/* 1.3.9999.3.9 */
+	OID_falcon_padded1024,			/* 1.3.9999.3.11 */
+#endif
+
 	/* CSOR FIPS-202 SHA-3 */
 	OID_sha3_256,                           /* 2.16.840.1.101.3.4.2.8 */
 	OID_sha3_384,                           /* 2.16.840.1.101.3.4.2.9 */

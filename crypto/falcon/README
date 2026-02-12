@@ -1,0 +1,61 @@
+FALCON Post-Quantum Signature Verification
+==========================================
+
+This directory contains FALCON (Fast-Fourier Lattice-based Compact Signatures
+over NTRU) post-quantum signature VERIFICATION for the Linux kernel.
+
+FALCON is a NIST-selected post-quantum cryptographic signature algorithm
+(FIPS 206 / FN-DSA standardization in progress).
+
+Source
+------
+Based on PQClean reference implementation:
+https://github.com/PQClean/PQClean/tree/master/crypto_sign/falcon-512
+
+License: MIT (compatible with GPL-2.0)
+
+Files
+-----
+- vrfy.c        : Signature verification logic (adapted from reference)
+- codec.c       : Signature encoding/decoding (adapted from reference)
+- common.c      : Common utilities (adapted from reference)
+- fpr.c/fpr.h   : Floating-point replacement (adapted from reference)
+- inner.h       : Internal definitions (adapted from reference)
+- api.h         : API definitions (adapted from reference)
+- falcon_verify.c : Kernel crypto API integration (NEW)
+- Kconfig       : Kernel configuration (NEW)
+- Makefile      : Build system integration (NEW)
+
+Kernel Integration
+------------------
+The kernel only needs SIGNATURE VERIFICATION. Key generation and signing
+happen in userspace.
+
+Supported parameter sets:
+- FALCON-512 (NIST security level 1, comparable to AES-128)
+- FALCON-1024 (NIST security level 5, comparable to AES-256)
+
+Dependencies:
+- CONFIG_CRYPTO_HASH
+- CONFIG_CRYPTO_SHA256 or CONFIG_CRYPTO_SHA512
+- CONFIG_ASYMMETRIC_KEY_TYPE
+- CONFIG_X509_CERTIFICATE_PARSER
+
+Usage
+-----
+Used by:
+- X.509 certificate verification (crypto/asymmetric_keys/)
+- PKCS#7 signature verification
+- Module signing (scripts/sign-file)
+- Boot certificate validation (security/boot_certs/)
+- IMA/EVM (security/integrity/)
+
+Status
+------
+WORK IN PROGRESS - Not yet functional
+
+Next steps:
+1. Adapt reference code for kernel environment (remove libc dependencies)
+2. Integrate with kernel crypto API (crypto_sig)
+3. Add X.509 and PKCS#7 support
+4. Test with boot_certs system

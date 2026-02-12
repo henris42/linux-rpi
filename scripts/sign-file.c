@@ -226,10 +226,11 @@ int main(int argc, char **argv)
 	bool save_sig = false, replace_orig;
 	bool sign_only = false;
 	bool raw_sig = false;
+	bool is_pqc = false;
 	unsigned char buf[4096];
 	unsigned long module_size, sig_size;
 	unsigned int use_signed_attrs;
-	const EVP_MD *digest_algo;
+	const EVP_MD *digest_algo = NULL;
 	EVP_PKEY *private_key;
 #ifndef USE_PKCS7
 	CMS_ContentInfo *cms = NULL;
@@ -308,11 +309,29 @@ int main(int argc, char **argv)
 		private_key = read_private_key(private_key_name);
 		x509 = read_x509(x509_name);
 
-		/* Digest the module data. */
-		OpenSSL_add_all_digests();
-		drain_openssl_errors(__LINE__, 0);
-		digest_algo = EVP_get_digestbyname(hash_algo);
-		ERR(!digest_algo, "EVP_get_digestbyname");
+#if OPENSSL_VERSION_MAJOR >= 3
+		/*
+		 * Detect post-quantum key types (FALCON, etc.) provided by
+		 * oqs-provider. PQC algorithms handle hashing internally
+		 * so no separate digest algorithm is needed for CMS signing.
+		 */
+		{
+			const char *pkey_type;
+			pkey_type = EVP_PKEY_get0_type_name(private_key);
+			if (pkey_type &&
+			    (strcasestr(pkey_type, "falcon") ||
+			     strcasestr(pkey_type, "dilithium") ||
+			     strcasestr(pkey_type, "sphincs")))
+				is_pqc = true;
+		}
+#endif
+		if (!is_pqc) {
+			/* Digest the module data. */
+			OpenSSL_add_all_digests();
+			drain_openssl_errors(__LINE__, 0);
+			digest_algo = EVP_get_digestbyname(hash_algo);
+			ERR(!digest_algo, "EVP_get_digestbyname");
+		}
 
 #ifndef USE_PKCS7
 		/* Load the signature message from the digest buffer. */
