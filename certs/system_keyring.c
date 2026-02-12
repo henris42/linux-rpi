@@ -30,6 +30,9 @@ static struct key *machine_trusted_keys;
 #ifdef CONFIG_INTEGRITY_PLATFORM_KEYRING
 static struct key *platform_trusted_keys;
 #endif
+#ifdef CONFIG_BOOT_CERTS_SYSFS
+static struct key *boot_root_certs;
+#endif
 
 extern __initconst const u8 system_certificate_list[];
 extern __initconst const unsigned long system_certificate_list_size;
@@ -323,36 +326,107 @@ static const struct key_restriction secondary_trusted_keys_deny_restrict = {
 	.check = restrict_link_deny,
 };
 
+/*
+ * Add a DER-encoded X.509 certificate to the .boot_root_certs keyring.
+ * This keyring holds only root CA certificates for boot chain validation.
+ */
+int boot_root_certs_add_cert(const void *der, size_t der_len, const char *desc)
+{
+#if !IS_ENABLED(CONFIG_BOOT_CERTS_SYSFS)
+	return -EOPNOTSUPP;
+#else
+	key_ref_t keyring_ref;
+	key_ref_t key_ref;
+
+	if (!boot_root_certs)
+		return -ENOKEY;
+	if (!der || der_len == 0 || !desc)
+		return -EINVAL;
+
+	keyring_ref = make_key_ref(boot_root_certs, 1);
+
+	key_ref = key_create_or_update(keyring_ref,
+				       "asymmetric",
+				       desc,
+				       der,
+				       der_len,
+				       KEY_POS_ALL | KEY_USR_VIEW,
+				       KEY_ALLOC_NOT_IN_QUOTA |
+				       KEY_ALLOC_BYPASS_RESTRICTION);
+	if (IS_ERR(key_ref))
+		return PTR_ERR(key_ref);
+
+	key_ref_put(key_ref);
+	return 0;
+#endif
+}
+EXPORT_SYMBOL_GPL(boot_root_certs_add_cert);
+
 int secondary_trusted_keys_seal(void)
 {
 #if !IS_ENABLED(CONFIG_BOOT_CERTS_SYSFS)
 	return -EOPNOTSUPP;
 #else
 	key_ref_t keyring_ref;
+	key_ref_t boot_root_ref;
 	char restr[64];
 	int ret;
 
 	if (!secondary_trusted_keys)
 		return -ENOKEY;
 
-	keyring_ref = make_key_ref(secondary_trusted_keys, 1);
-
-	/* Try self-contained restriction if supported by this tree */
-	snprintf(restr, sizeof(restr), "key_or_keyring:%u",
-		 secondary_trusted_keys->serial);
-
-	ret = keyring_restrict(keyring_ref, "asymmetric", restr);
-	if (ret == 0 || ret == -EEXIST)
-		return 0;
-
 	/*
-	 * If the kernel doesn't understand the restriction string,
-	 * don't fail boot/module loading. Keep it unsealed (policy-only)
-	 * and rely on your boot_certs module’s own gating for now.
+	 * Hierarchical sealing strategy:
+	 * 1. Seal boot_root_certs to prevent new root CAs
+	 * 2. Restrict secondary_trusted_keys to only accept certs signed by boot_root_certs
+	 *
+	 * This allows intermediate CAs to be added if signed by a root CA,
+	 * but prevents any new root CAs from being added.
 	 */
-	if (ret == -EINVAL) {
-		pr_warn("secondary_trusted_keys: seal restriction '%s' unsupported; leaving keyring unrestricted\n",
-			restr);
+
+	/* Step 1: Seal the boot root keyring (no new roots allowed) */
+	if (boot_root_certs) {
+		boot_root_ref = make_key_ref(boot_root_certs, 1);
+		ret = keyring_restrict(boot_root_ref, NULL, NULL);
+		if (ret && ret != -EEXIST) {
+			pr_err("boot_root_certs: failed to seal root keyring (err=%d)\n", ret);
+			return ret;
+		}
+		pr_notice("boot_root_certs: sealed (no new root CAs allowed)\n");
+	}
+
+	/* Step 2: Restrict secondary to only accept certs signed by boot roots */
+	if (boot_root_certs) {
+		keyring_ref = make_key_ref(secondary_trusted_keys, 1);
+
+		/*
+		 * Use key_or_keyring restriction (NOT chain).
+		 * This validates new certs against boot_root_certs only,
+		 * NOT against keys already in secondary_trusted_keys.
+		 * This ensures only root CAs can sign new certificates.
+		 */
+		snprintf(restr, sizeof(restr), "key_or_keyring:%u",
+			 boot_root_certs->serial);
+
+		ret = keyring_restrict(keyring_ref, "asymmetric", restr);
+		if (ret == 0 || ret == -EEXIST) {
+			pr_notice("secondary_trusted_keys: sealed (accepts only boot root CA-signed certs)\n");
+			return 0;
+		}
+
+		if (ret == -EINVAL) {
+			pr_warn("secondary_trusted_keys: 'key_or_keyring' restriction unsupported\n");
+			return ret;
+		}
+
+		return ret;
+	}
+
+	/* Fallback: No boot_root_certs, seal completely */
+	keyring_ref = make_key_ref(secondary_trusted_keys, 1);
+	ret = keyring_restrict(keyring_ref, NULL, NULL);
+	if (ret == 0 || ret == -EEXIST) {
+		pr_notice("secondary_trusted_keys: sealed (no boot roots, fully locked)\n");
 		return 0;
 	}
 
@@ -435,6 +509,28 @@ secondary_trusted_keys =
 
 	if (key_link(secondary_trusted_keys, builtin_trusted_keys) < 0)
 		panic("Can't link trusted keyrings\n");
+
+#if IS_ENABLED(CONFIG_BOOT_CERTS_SYSFS)
+	/*
+	 * Create a separate keyring for boot root certificates.
+	 * This keyring will contain only self-signed root CAs from the boot chain.
+	 * It will be sealed separately to prevent new root CAs being added,
+	 * while secondary_trusted_keys can still accept intermediate CAs
+	 * signed by these roots.
+	 */
+	boot_root_certs =
+		keyring_alloc(".boot_root_certs",
+			      GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, current_cred(),
+			      ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
+			       KEY_USR_VIEW | KEY_USR_READ | KEY_USR_SEARCH),
+			      KEY_ALLOC_NOT_IN_QUOTA,
+			      NULL,   /* No restriction yet - boot_certs will populate then seal */
+			      NULL);
+	if (IS_ERR(boot_root_certs))
+		panic("Can't allocate boot_root_certs keyring\n");
+
+	pr_notice("Boot root certificate keyring initialized\n");
+#endif
 
 #endif
 

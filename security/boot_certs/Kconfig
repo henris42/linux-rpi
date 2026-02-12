@@ -1,15 +1,34 @@
 # SPDX-License-Identifier: GPL-2.0
 
 config BOOT_CERTS_SYSFS
-	tristate "Expose verified boot cert chain via sysfs"
+	bool "Boot certificate validation and keyring sealing"
 	depends on SYSFS
 	depends on KEYS
-	select CRYPTO
-	select CRYPTO_HASH
+	depends on SECONDARY_TRUSTED_KEYRING
 	select CRYPTO_SHA3
 	select BASE64
 	help
-	  ...
+	  Enable boot-time certificate chain validation with SHA3-512 hash
+	  pinning, hierarchical keyring sealing, and certificate expiry
+	  enforcement.
+
+	  This must be built into the kernel (not a module) to ensure
+	  certificate validation occurs before any third-party modules
+	  are loaded. The system reads /boot/firmware/certs/chain.pem
+	  (or configured boot partition), validates it against a SHA3-512
+	  hash provided via kernel cmdline (boot_certs.sha3=...), and
+	  loads certificates into separate keyrings:
+	    - .boot_root_certs: Immutable root CAs (sealed at boot)
+	    - .secondary_trusted_keys: All certs, allows root-signed additions
+
+	  This prevents unauthorized modification of the trusted certificate
+	  chain and enables runtime addition of intermediate CAs signed by
+	  the boot root CAs.
+
+	  Future versions will support secure element storage (TPM, SE)
+	  instead of filesystem-based certificate loading.
+
+	  If unsure, say N.
 
 config BOOT_CERTS_SEAL_AT_BOOT
 	bool "Seal .secondary_trusted_keys at boot"
@@ -30,4 +49,98 @@ config BOOT_CERTS_MAX_BYTES
 	default 262144
 	help
 	  Maximum size of the PEM bundle read from <boot>/certs/chain.pem.
+
+config BOOT_CERTS_USE_MEM_ADDR
+	bool "Use fixed memory address for certificates (testing)"
+	depends on BOOT_CERTS_SYSFS
+	default n
+	help
+	  Use a fixed memory address for certificate loading instead of
+	  filesystem. This is for testing before U-Boot FIT integration
+	  is complete. In production, U-Boot will pass the address via
+	  boot_certs.addr= and boot_certs.len= kernel parameters.
+
+	  If enabled, you must specify the memory address and length below.
+
+config BOOT_CERTS_MEM_ADDR
+	hex "Physical memory address of certificate chain"
+	depends on BOOT_CERTS_USE_MEM_ADDR
+	default 0x10000000
+	help
+	  Physical memory address where the certificate chain is located.
+	  This will be used instead of reading from filesystem.
+
+	  Example: 0x10000000 (256MB offset)
+
+	  Note: You must ensure the bootloader or firmware has placed
+	  valid certificate data at this address before the kernel boots.
+
+config BOOT_CERTS_MEM_LEN
+	int "Length of certificate chain in bytes"
+	depends on BOOT_CERTS_USE_MEM_ADDR
+	range 1 16384
+	default 4096
+	help
+	  Size of the certificate chain in bytes at the configured
+	  memory address.
+
+	  This should match the actual size of your chain.pem file.
+
+choice
+	prompt "Certificate expiry policy"
+	depends on BOOT_CERTS_SYSFS
+	default BOOT_CERTS_EXPIRY_WARN
+	help
+	  Define the action to take when expired certificates are encountered.
+
+config BOOT_CERTS_EXPIRY_WARN
+	bool "Warn only (log to dmesg)"
+	help
+	  Expired certificates trigger a warning in dmesg but are still loaded.
+	  Use this for testing or when you have external monitoring.
+
+config BOOT_CERTS_EXPIRY_REJECT
+	bool "Reject expired certificates"
+	help
+	  Refuse to load or add expired certificates. Boot will fail if
+	  chain.pem contains expired certificates. This is the recommended
+	  setting for production systems.
+
+config BOOT_CERTS_EXPIRY_STRICT
+	bool "Reject certificates expiring soon (strict mode)"
+	help
+	  Refuse to load certificates that are expired OR will expire within
+	  the grace period defined by BOOT_CERTS_EXPIRY_GRACE_DAYS.
+	  This ensures you have time to rotate certificates before expiry.
+
+endchoice
+
+config BOOT_CERTS_EXPIRY_GRACE_DAYS
+	int "Grace period for expiry warnings (days)"
+	depends on BOOT_CERTS_SYSFS
+	range 1 365
+	default 30
+	help
+	  Number of days before expiry to start warning about certificates
+	  that will expire soon. In STRICT mode, certificates within this
+	  grace period will be rejected.
+
+config BOOT_CERTS_EXPIRY_CHECK_DAILY
+	bool "Enable daily certificate expiry checks"
+	depends on BOOT_CERTS_SYSFS
+	default y
+	help
+	  Run a daily workqueue task to check for expired or expiring
+	  certificates in the boot certificate chain. Warnings are logged
+	  to dmesg and exposed via sysfs.
+
+config BOOT_CERTS_EXPIRY_CHECK_INTERVAL
+	int "Certificate expiry check interval (hours)"
+	depends on BOOT_CERTS_EXPIRY_CHECK_DAILY
+	range 1 168
+	default 24
+	help
+	  How often to check certificate expiry (in hours).
+	  Default is 24 hours (daily check).
+	  Minimum 1 hour, maximum 168 hours (1 week).
 

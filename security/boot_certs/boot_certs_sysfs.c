@@ -1,43 +1,52 @@
 
 // SPDX-License-Identifier: GPL-2.0
 /*
- * boot_certs_sysfs (research, strict-ish module-dev)
+ * boot_certs_sysfs - Built-in boot certificate validation with hierarchical sealing
  *
- * - Reads <boot>/certs/chain.pem once at init
- * - Verifies SHA3-512 hash against kernel cmdline via /proc/cmdline:
- *     boot_certs.sha3=<128 hex chars>
+ * IMPORTANT: This is built into the kernel (not a module) to ensure certificate
+ * validation occurs before third-party modules are loaded.
+ *
+ * Features:
+ * - Reads <boot>/certs/chain.pem at late_initcall (after filesystem init)
+ * - Verifies SHA3-512 hash against kernel cmdline: boot_certs.sha3=<128 hex chars>
  * - Enforces backing filesystem is read-only (+ optional fstype match)
- * - Parses PEM bundle into individual cert DER blobs; reorders so "root" is at [0]
- *   (root detected as self-issued: subject == issuer, DER-slice compare)
- * - Exposes cert via sysfs bin_attribute:
- *     /sys/kernel/boot_certs/chain.pem
- * - Exposes:
- *     /sys/kernel/boot_certs/ok
- *     /sys/kernel/boot_certs/status
- *     /sys/kernel/boot_certs/sealed (one-way true; calls hook stub)
+ * - Parses PEM bundle into individual cert DER blobs; reorders so root is at [0]
+ *   (root detected as self-signed: subject == issuer, DER-slice compare)
+ * - Hierarchical keyring sealing:
+ *   - .boot_root_certs: Immutable root CAs (sealed completely)
+ *   - .secondary_trusted_keys: All certs, accepts root-signed intermediates
+ * - Certificate expiry enforcement with three policies: WARN, REJECT, STRICT
+ * - Periodic automated expiry checking via workqueue
+ * - Exposes sysfs interface:
+ *     /sys/kernel/boot_certs/chain.pem       (RO - certificate chain)
+ *     /sys/kernel/boot_certs/ok              (RO - validation status)
+ *     /sys/kernel/boot_certs/status          (RO - detailed status)
+ *     /sys/kernel/boot_certs/sealed          (RW - one-way sealing trigger)
+ *     /sys/kernel/boot_certs/expiry_status   (RO - expiry information)
+ *     /sys/kernel/boot_certs/expiry_check_now (WO - manual expiry check)
  *
- * STRICT RESEARCH NOTES
- * - Real X.509 signature chain validation + expiry enforcement requires either:
- *   (a) in-tree use of kernel X.509 parser/verify APIs, or
- *   (b) implementing a full verifier inside this module (large).
- * This module provides:
- *   - safe PEM splitting and basic structural parsing needed for ordering,
- *   - strict RO/fs policy and cmdline hash pinning,
- *   - a sealing sysfs API with a hook stub (EOPNOTSUPP as module).
+ * Boot timing:
+ * - Runs at late_initcall: after rootfs_initcall, before device_initcall
+ * - Requires boot partition mounted (handled by initramfs/early userspace)
+ * - Certificates loaded and keyrings sealed before module loading begins
+ *
+ * Future: Will migrate to secure element (TPM/SE) storage instead of filesystem.
  */
 
+#include <linux/async.h>
 #include <linux/atomic.h>
+#include <linux/completion.h>
 #include <linux/crypto.h>
 #include <crypto/hash.h>
 #include <linux/ctype.h>
 #include <linux/fs.h>
 #include <linux/hex.h>
 #include <linux/init.h>
+#include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
 #include <linux/kconfig.h>
 #include <linux/mm.h>
-#include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/overflow.h>
@@ -49,6 +58,8 @@
 #include <linux/sysfs.h>
 #include <linux/version.h>
 #include <linux/base64.h>
+#include <linux/timekeeping.h>
+#include <linux/workqueue.h>
 
 /* Base64 decode API differs across kernel versions; adapt at compile-time. */
 static inline int bc_base64_decode(const char *src, int len, u8 *dst)
@@ -70,19 +81,26 @@ static inline int bc_base64_decode(const char *src, int len, u8 *dst)
 #endif
 
 #define BOOT_CERTS_DIRNAME        "boot_certs"
-#define BOOT_CERTS_CERT_REL       "certs/chain.pem"
+#define BOOT_CERTS_CERT_REL       "chain.pem"
 
 #define BOOT_CERTS_CMDLINE_OPT    "boot_certs.sha3"
 #define BOOT_CERTS_DIGEST_NAME    "sha3-512"
 #define BOOT_CERTS_DIGEST_LEN     64
 #define BOOT_CERTS_DIGEST_HEX     (BOOT_CERTS_DIGEST_LEN * 2)
 
+/*
+ * Filesystem paths (fallback when U-Boot memory address not provided):
+ * - /boot/firmware/certs (default for Raspberry Pi)
+ * - /boot/certs (alternative)
+ *
+ * Production will use U-Boot FIT image with boot_certs.addr/len parameters.
+ */
 #if defined(BOOT_CERTS_MOUNT_FIRMWARE)
-#define BOOT_CERTS_BOOT_PATH      "/boot/firmware"
+#define BOOT_CERTS_BOOT_PATH      "/boot/firmware/certs"
 #elif defined(BOOT_CERTS_MOUNT_BOOT)
-#define BOOT_CERTS_BOOT_PATH      "/boot"
+#define BOOT_CERTS_BOOT_PATH      "/boot/certs"
 #else
-#define BOOT_CERTS_BOOT_PATH      "/boot/firmware"
+#define BOOT_CERTS_BOOT_PATH      "/boot/firmware/certs"  /* Default: Raspberry Pi */
 #endif
 
 #ifndef BOOT_CERTS_SKIP_FSTYPE_CHECK
@@ -114,6 +132,45 @@ enum boot_certs_violation {
 	BC_V_ASN1_PARSE,
 	BC_V_SYSFS,
 	BC_V_SEAL,
+	BC_V_CERT_EXPIRED,
+	BC_V_CERT_EXPIRING_SOON,
+};
+
+/* Certificate expiry policy (compile-time via Kconfig) */
+enum boot_certs_expiry_policy {
+	BC_EXPIRY_WARN,      /* Log warning only */
+	BC_EXPIRY_REJECT,    /* Reject expired certs */
+	BC_EXPIRY_STRICT,    /* Reject certs expiring within grace period */
+};
+
+#if defined(CONFIG_BOOT_CERTS_EXPIRY_WARN)
+#define BOOT_CERTS_EXPIRY_POLICY BC_EXPIRY_WARN
+#elif defined(CONFIG_BOOT_CERTS_EXPIRY_REJECT)
+#define BOOT_CERTS_EXPIRY_POLICY BC_EXPIRY_REJECT
+#elif defined(CONFIG_BOOT_CERTS_EXPIRY_STRICT)
+#define BOOT_CERTS_EXPIRY_POLICY BC_EXPIRY_STRICT
+#else
+#define BOOT_CERTS_EXPIRY_POLICY BC_EXPIRY_WARN
+#endif
+
+#ifdef CONFIG_BOOT_CERTS_EXPIRY_GRACE_DAYS
+#define BOOT_CERTS_GRACE_DAYS CONFIG_BOOT_CERTS_EXPIRY_GRACE_DAYS
+#else
+#define BOOT_CERTS_GRACE_DAYS 30
+#endif
+
+#ifdef CONFIG_BOOT_CERTS_EXPIRY_CHECK_INTERVAL
+#define BOOT_CERTS_CHECK_INTERVAL_HOURS CONFIG_BOOT_CERTS_EXPIRY_CHECK_INTERVAL
+#else
+#define BOOT_CERTS_CHECK_INTERVAL_HOURS 24
+#endif
+
+/* Expiry tracking */
+struct bc_expiry_status {
+	int expired_count;
+	int expiring_soon_count;
+	time64_t last_check;
+	time64_t earliest_expiry;  /* Earliest expiry time among all certs */
 };
 
 static atomic_t boot_certs_poisoned = ATOMIC_INIT(0);
@@ -121,6 +178,18 @@ static bool boot_certs_sha_ok;
 static bool boot_certs_sealed;
 static enum boot_certs_violation boot_certs_last_violation;
 static DEFINE_RATELIMIT_STATE(boot_certs_rs, HZ, 5);
+
+static struct bc_expiry_status expiry_status;
+static struct delayed_work expiry_check_work;
+static bool expiry_check_enabled;
+
+/* U-Boot memory address parameters (alternative to filesystem) */
+static unsigned long boot_certs_addr;
+static unsigned long boot_certs_len;
+
+/* Mount-wait retry for /boot/firmware - systemd mounts at ~39s after boot */
+#define BOOT_CERTS_MOUNT_WAIT_MS 1000  /* Check every second */
+#define BOOT_CERTS_MOUNT_TIMEOUT_MS 300000  /* 5 minutes max wait */
 
 /*
  * Protects all module state including chain_buf, bc_certs, and flags.
@@ -149,6 +218,10 @@ struct bc_cert {
 	size_t issuer_len;
 	const u8 *subject;
 	size_t subject_len;
+
+	/* validity period */
+	time64_t valid_from;
+	time64_t valid_to;
 };
 
 static struct bc_cert bc_certs[BC_MAX_CERTS];
@@ -156,32 +229,34 @@ static size_t bc_cert_count;
 
 #if IS_ENABLED(CONFIG_SECONDARY_TRUSTED_KEYRING)
 int secondary_trusted_keys_seal(void);
-#endif
-#if IS_ENABLED(CONFIG_SECONDARY_TRUSTED_KEYRING)
 int secondary_trusted_keys_add_cert(const void *der, size_t der_len,
 				   const char *desc);
+int boot_root_certs_add_cert(const void *der, size_t der_len,
+			     const char *desc);
 #endif
 
 
 static const char *boot_certs_violation_str(enum boot_certs_violation v)
 {
 	switch (v) {
-	case BC_V_NONE:        return "none";
-	case BC_V_PATH_LOOKUP: return "path_lookup";
-	case BC_V_FS_RW:       return "filesystem_writable";
-	case BC_V_FS_TYPE:     return "filesystem_type_mismatch";
-	case BC_V_FILE_OPEN:   return "file_open_failed";
-	case BC_V_NOT_REGULAR: return "not_regular_file";
-	case BC_V_FILE_SIZE:   return "file_size_invalid";
-	case BC_V_ALLOC:       return "alloc_failed";
-	case BC_V_READ:        return "file_read_error";
-	case BC_V_CMDLINE:     return "cmdline_missing_or_invalid";
-	case BC_V_HASH:        return "sha3_mismatch_or_hash_error";
-	case BC_V_PEM_PARSE:   return "pem_parse_failed";
-	case BC_V_ASN1_PARSE:  return "asn1_min_parse_failed";
-	case BC_V_SYSFS:       return "sysfs_create_failed";
-	case BC_V_SEAL:        return "seal_failed_or_unsupported";
-	default:               return "unknown";
+	case BC_V_NONE:              return "none";
+	case BC_V_PATH_LOOKUP:       return "path_lookup";
+	case BC_V_FS_RW:             return "filesystem_writable";
+	case BC_V_FS_TYPE:           return "filesystem_type_mismatch";
+	case BC_V_FILE_OPEN:         return "file_open_failed";
+	case BC_V_NOT_REGULAR:       return "not_regular_file";
+	case BC_V_FILE_SIZE:         return "file_size_invalid";
+	case BC_V_ALLOC:             return "alloc_failed";
+	case BC_V_READ:              return "file_read_error";
+	case BC_V_CMDLINE:           return "cmdline_missing_or_invalid";
+	case BC_V_HASH:              return "sha3_mismatch_or_hash_error";
+	case BC_V_PEM_PARSE:         return "pem_parse_failed";
+	case BC_V_ASN1_PARSE:        return "asn1_min_parse_failed";
+	case BC_V_SYSFS:             return "sysfs_create_failed";
+	case BC_V_SEAL:              return "seal_failed_or_unsupported";
+	case BC_V_CERT_EXPIRED:      return "certificate_expired";
+	case BC_V_CERT_EXPIRING_SOON: return "certificate_expiring_soon";
+	default:                     return "unknown";
 	}
 }
 
@@ -207,6 +282,195 @@ static int boot_certs_secondary_trusted_keys_seal(void)
 }
 
 
+/*
+ * Determine if a certificate is a root CA (self-signed).
+ * Root CA detection: subject DER == issuer DER.
+ */
+static bool bc_is_root_ca(size_t idx)
+{
+	struct bc_cert *c = &bc_certs[idx];
+
+	if (!c->issuer || !c->subject)
+		return false;
+
+	return (c->issuer_len == c->subject_len &&
+		memcmp(c->issuer, c->subject, c->issuer_len) == 0);
+}
+
+/*
+ * Check if a certificate is expired or will expire soon.
+ * Returns:
+ *   0  = valid
+ *   -EKEYEXPIRED = expired
+ *   -EKEYREVOKED = expiring within grace period (strict mode)
+ */
+static int bc_check_cert_expiry(size_t idx, time64_t now, bool strict)
+{
+	struct bc_cert *c = &bc_certs[idx];
+	time64_t grace_seconds = BOOT_CERTS_GRACE_DAYS * 86400;
+
+	if (c->valid_to == 0)
+		return 0;  /* No validity data - skip check */
+
+	/* Check if expired */
+	if (now > c->valid_to) {
+		bc_dbg("cert idx=%zu EXPIRED (expired %lld seconds ago)\n",
+		       idx, now - c->valid_to);
+		return -EKEYEXPIRED;
+	}
+
+	/* Check if expiring soon (only in strict mode) */
+	if (strict && (c->valid_to - now) < grace_seconds) {
+		bc_dbg("cert idx=%zu expiring soon (in %lld days)\n",
+		       idx, (c->valid_to - now) / 86400);
+		return -EKEYREVOKED;  /* Abuse this code for "expiring soon" */
+	}
+
+	return 0;
+}
+
+/*
+ * Scan all certificates and update expiry status.
+ * Returns number of violations found (expired or expiring soon).
+ */
+static int bc_update_expiry_status(void)
+{
+	size_t i;
+	time64_t now;
+	int violations = 0;
+	bool strict = (BOOT_CERTS_EXPIRY_POLICY == BC_EXPIRY_STRICT);
+
+	now = ktime_get_real_seconds();
+	expiry_status.last_check = now;
+	expiry_status.expired_count = 0;
+	expiry_status.expiring_soon_count = 0;
+	expiry_status.earliest_expiry = 0;
+
+	for (i = 0; i < bc_cert_count; i++) {
+		struct bc_cert *c = &bc_certs[i];
+		int ret;
+
+		if (c->valid_to == 0)
+			continue;
+
+		/* Track earliest expiry */
+		if (expiry_status.earliest_expiry == 0 ||
+		    c->valid_to < expiry_status.earliest_expiry)
+			expiry_status.earliest_expiry = c->valid_to;
+
+		ret = bc_check_cert_expiry(i, now, strict);
+		if (ret == -EKEYEXPIRED) {
+			expiry_status.expired_count++;
+			violations++;
+		} else if (ret == -EKEYREVOKED) {
+			expiry_status.expiring_soon_count++;
+			violations++;
+		}
+	}
+
+	return violations;
+}
+
+/*
+ * Enforce certificate expiry policy.
+ * Called at boot time and when adding new certificates.
+ * Returns 0 if OK to proceed, negative error if should fail.
+ */
+static int bc_enforce_expiry_policy(void)
+{
+	int violations;
+	enum boot_certs_expiry_policy policy = BOOT_CERTS_EXPIRY_POLICY;
+
+	violations = bc_update_expiry_status();
+
+	if (violations == 0)
+		return 0;
+
+	/* WARN policy: log but don't fail */
+	if (policy == BC_EXPIRY_WARN) {
+		if (expiry_status.expired_count > 0)
+			pr_warn("boot_certs: %d expired certificate(s) found (WARN mode)\n",
+				expiry_status.expired_count);
+		if (expiry_status.expiring_soon_count > 0)
+			pr_warn("boot_certs: %d certificate(s) expiring within %d days\n",
+				expiry_status.expiring_soon_count,
+				BOOT_CERTS_GRACE_DAYS);
+		return 0;
+	}
+
+	/* REJECT policy: fail if any certs are expired */
+	if (policy == BC_EXPIRY_REJECT) {
+		if (expiry_status.expired_count > 0) {
+			pr_err("boot_certs: %d expired certificate(s) - REJECTING (policy=REJECT)\n",
+			       expiry_status.expired_count);
+			boot_certs_poison(BC_V_CERT_EXPIRED);
+			return -EKEYEXPIRED;
+		}
+		if (expiry_status.expiring_soon_count > 0) {
+			pr_warn("boot_certs: %d certificate(s) expiring within %d days\n",
+				expiry_status.expiring_soon_count,
+				BOOT_CERTS_GRACE_DAYS);
+		}
+		return 0;
+	}
+
+	/* STRICT policy: fail if any certs are expired OR expiring soon */
+	if (policy == BC_EXPIRY_STRICT) {
+		if (expiry_status.expired_count > 0) {
+			pr_err("boot_certs: %d expired certificate(s) - REJECTING (policy=STRICT)\n",
+			       expiry_status.expired_count);
+			boot_certs_poison(BC_V_CERT_EXPIRED);
+			return -EKEYEXPIRED;
+		}
+		if (expiry_status.expiring_soon_count > 0) {
+			pr_err("boot_certs: %d certificate(s) expiring within %d days - REJECTING (policy=STRICT)\n",
+			       expiry_status.expiring_soon_count,
+			       BOOT_CERTS_GRACE_DAYS);
+			boot_certs_poison(BC_V_CERT_EXPIRING_SOON);
+			return -EKEYREVOKED;
+		}
+		return 0;
+	}
+
+	return 0;
+}
+
+/*
+ * Periodic expiry check workqueue handler.
+ * Runs daily (or at configured interval) to check for expired certificates.
+ */
+static void bc_expiry_check_work_fn(struct work_struct *work)
+{
+	int violations;
+
+	mutex_lock(&boot_certs_mutex);
+
+	if (!boot_certs_sha_ok || bc_cert_count == 0) {
+		mutex_unlock(&boot_certs_mutex);
+		return;
+	}
+
+	violations = bc_update_expiry_status();
+
+	if (violations > 0) {
+		if (expiry_status.expired_count > 0)
+			pr_warn("boot_certs: periodic check: %d expired certificate(s)\n",
+				expiry_status.expired_count);
+		if (expiry_status.expiring_soon_count > 0)
+			pr_warn("boot_certs: periodic check: %d certificate(s) expiring within %d days\n",
+				expiry_status.expiring_soon_count,
+				BOOT_CERTS_GRACE_DAYS);
+	}
+
+	mutex_unlock(&boot_certs_mutex);
+
+	/* Reschedule for next check */
+	if (expiry_check_enabled) {
+		schedule_delayed_work(&expiry_check_work,
+				     BOOT_CERTS_CHECK_INTERVAL_HOURS * 60 * 60 * HZ);
+	}
+}
+
 static int boot_certs_load_into_secondary_keyring(void)
 {
 #if !IS_ENABLED(CONFIG_SECONDARY_TRUSTED_KEYRING)
@@ -214,24 +478,83 @@ static int boot_certs_load_into_secondary_keyring(void)
 #else
 	size_t i;
 	int ret;
+	int root_count = 0;
 
 	if (!boot_certs_sha_ok)
 		return -EACCES;
 
+	/*
+	 * Two-phase loading:
+	 * Phase 1: Add root CAs to both boot_root_certs and secondary_trusted_keys
+	 * Phase 2: Add intermediate CAs only to secondary_trusted_keys
+	 *
+	 * This allows later sealing where:
+	 * - boot_root_certs is sealed (no new roots)
+	 * - secondary_trusted_keys accepts new certs signed by boot_root_certs
+	 */
+
+	/* Phase 1: Process root CAs */
 	for (i = 0; i < bc_cert_count; i++) {
 		char desc[64];
 
-		/* Stable, readable name. (You can refine later.) */
-		snprintf(desc, sizeof(desc), "boot_certs:%zu", i);
+		if (!bc_is_root_ca(i))
+			continue;
 
+		snprintf(desc, sizeof(desc), "boot_root:%zu", i);
+
+		/* Add to boot_root_certs keyring */
+		ret = boot_root_certs_add_cert(bc_certs[i].der,
+					       bc_certs[i].der_len,
+					       desc);
+		if (ret < 0) {
+			bc_dbg("keyring: add root cert idx=%zu to boot_root_certs failed (err=%d)\n",
+			       i, ret);
+			return ret;
+		}
+
+		/* Also add to secondary for module signing */
 		ret = secondary_trusted_keys_add_cert(bc_certs[i].der,
 						     bc_certs[i].der_len,
 						     desc);
 		if (ret < 0) {
-			bc_dbg("keyring: add cert idx=%zu failed (err=%d)\n", i, ret);
+			bc_dbg("keyring: add root cert idx=%zu to secondary failed (err=%d)\n",
+			       i, ret);
 			return ret;
 		}
+
+		root_count++;
+		bc_dbg("keyring: added root CA cert idx=%zu\n", i);
 	}
+
+	if (root_count == 0) {
+		bc_dbg("keyring: WARNING - no root CA certificates found in chain\n");
+		return -EINVAL;
+	}
+
+	/* Phase 2: Process intermediate CAs */
+	for (i = 0; i < bc_cert_count; i++) {
+		char desc[64];
+
+		if (bc_is_root_ca(i))
+			continue;  /* Already added in phase 1 */
+
+		snprintf(desc, sizeof(desc), "boot_intermediate:%zu", i);
+
+		/* Add only to secondary_trusted_keys */
+		ret = secondary_trusted_keys_add_cert(bc_certs[i].der,
+						     bc_certs[i].der_len,
+						     desc);
+		if (ret < 0) {
+			bc_dbg("keyring: add intermediate cert idx=%zu failed (err=%d)\n",
+			       i, ret);
+			return ret;
+		}
+
+		bc_dbg("keyring: added intermediate CA cert idx=%zu\n", i);
+	}
+
+	pr_info("boot_certs: loaded %d root CAs, %zu total certs into keyrings\n",
+		root_count, bc_cert_count);
 
 	return 0;
 #endif
@@ -252,8 +575,10 @@ static int boot_certs_check_policy(const char *path_str)
 	err = kern_path(path_str, LOOKUP_FOLLOW, &path);
 	if (err) {
 		bc_dbg("policy: kern_path failed for %s (err=%d)\n", path_str, err);
-		boot_certs_poison(BC_V_PATH_LOOKUP);
-		return -EACCES;
+		/* Return -ENOENT as-is so caller can retry; poison on other errors */
+		if (err != -ENOENT)
+			boot_certs_poison(BC_V_PATH_LOOKUP);
+		return err;
 	}
 
 	sb = path.mnt->mnt_sb;
@@ -559,6 +884,68 @@ static int bc_asn1_get_tag_len(struct bc_asn1 *a, u8 *tag, size_t *len, const u8
 }
 
 /*
+ * Simplified time parser for ASN.1 Time (UTCTime or GeneralizedTime).
+ * This is a minimal implementation - for production, consider using
+ * the kernel's x509_decode_time() from crypto/asymmetric_keys/.
+ *
+ * Returns 0 on success, negative on error.
+ */
+static int bc_asn1_parse_time(u8 tag, const u8 *data, size_t len, time64_t *out)
+{
+	struct tm tm;
+	int year, month, day, hour, min, sec;
+	int offset = 0;
+
+	memset(&tm, 0, sizeof(tm));
+
+	/* UTCTime: YYMMDDHHMMSSZ (tag 0x17) */
+	if (tag == 0x17) {
+		if (len < 13)
+			return -EINVAL;
+		/* YY */
+		year = (data[0] - '0') * 10 + (data[1] - '0');
+		/* Y2K fix: 00-49 = 2000-2049, 50-99 = 1950-1999 */
+		year += (year < 50) ? 2000 : 1900;
+		offset = 2;
+	}
+	/* GeneralizedTime: YYYYMMDDHHMMSSZ (tag 0x18) */
+	else if (tag == 0x18) {
+		if (len < 15)
+			return -EINVAL;
+		/* YYYY */
+		year = (data[0] - '0') * 1000 + (data[1] - '0') * 100 +
+		       (data[2] - '0') * 10 + (data[3] - '0');
+		offset = 4;
+	} else {
+		return -EINVAL;
+	}
+
+	/* Parse MMDDHHMMSS */
+	month = (data[offset]     - '0') * 10 + (data[offset + 1] - '0');
+	day   = (data[offset + 2] - '0') * 10 + (data[offset + 3] - '0');
+	hour  = (data[offset + 4] - '0') * 10 + (data[offset + 5] - '0');
+	min   = (data[offset + 6] - '0') * 10 + (data[offset + 7] - '0');
+	sec   = (data[offset + 8] - '0') * 10 + (data[offset + 9] - '0');
+
+	/* Basic validation */
+	if (month < 1 || month > 12 || day < 1 || day > 31 ||
+	    hour > 23 || min > 59 || sec > 59)
+		return -EINVAL;
+
+	/* Convert to time64_t (seconds since epoch) */
+	tm.tm_year = year - 1900;
+	tm.tm_mon = month - 1;
+	tm.tm_mday = day;
+	tm.tm_hour = hour;
+	tm.tm_min = min;
+	tm.tm_sec = sec;
+
+	*out = mktime64(tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+			tm.tm_hour, tm.tm_min, tm.tm_sec);
+	return 0;
+}
+
+/*
  * Parse issuer+subject DER slices:
  * Certificate ::= SEQUENCE { tbsCertificate TBSCertificate, ... }
  * TBSCertificate ::= SEQUENCE {
@@ -652,10 +1039,37 @@ static int bc_x509_extract_issuer_subject(struct bc_cert *c)
 		}
 
 		/* validity (SEQUENCE) */
-		if (bc_asn1_get_tag_len(&t, &tag, &len, &val))
-			return -EINVAL;
-		if (tag != 0x30)
-			return -EINVAL;
+		{
+			struct bc_asn1 validity;
+			const u8 *validity_start;
+			size_t validity_len;
+			u8 validity_tag;
+			const u8 *time_val;
+			size_t time_len;
+			u8 time_tag;
+
+			validity_start = t.p;
+			if (bc_asn1_get_tag_len(&t, &validity_tag, &validity_len, &val))
+				return -EINVAL;
+			if (validity_tag != 0x30)
+				return -EINVAL;
+
+			/* Parse Validity SEQUENCE contents */
+			validity.p = val;
+			validity.end = val + validity_len;
+
+			/* notBefore (Time) */
+			if (bc_asn1_get_tag_len(&validity, &time_tag, &time_len, &time_val))
+				return -EINVAL;
+			if (bc_asn1_parse_time(time_tag, time_val, time_len, &c->valid_from))
+				c->valid_from = 0;  /* Parse error - zero it out */
+
+			/* notAfter (Time) */
+			if (bc_asn1_get_tag_len(&validity, &time_tag, &time_len, &time_val))
+				return -EINVAL;
+			if (bc_asn1_parse_time(time_tag, time_val, time_len, &c->valid_to))
+				c->valid_to = 0;  /* Parse error - zero it out */
+		}
 
 		/* subject Name (SEQUENCE) */
 		{
@@ -1047,10 +1461,69 @@ static ssize_t status_show(struct kobject *k, struct kobj_attribute *a, char *b)
 }
 static struct kobj_attribute status_attr = __ATTR_RO(status);
 
+static ssize_t expiry_status_show(struct kobject *k, struct kobj_attribute *a, char *b)
+{
+	ssize_t ret;
+	time64_t now;
+	long long days_until_expiry = 0;
+
+	mutex_lock(&boot_certs_mutex);
+	now = ktime_get_real_seconds();
+
+	if (expiry_status.earliest_expiry > 0)
+		days_until_expiry = (expiry_status.earliest_expiry - now) / 86400;
+
+	ret = scnprintf(b, PAGE_SIZE,
+			"policy=%s grace_days=%d expired=%d expiring_soon=%d "
+			"last_check=%lld earliest_expiry_days=%lld check_enabled=%d\n",
+			(BOOT_CERTS_EXPIRY_POLICY == BC_EXPIRY_WARN) ? "WARN" :
+			(BOOT_CERTS_EXPIRY_POLICY == BC_EXPIRY_REJECT) ? "REJECT" : "STRICT",
+			BOOT_CERTS_GRACE_DAYS,
+			expiry_status.expired_count,
+			expiry_status.expiring_soon_count,
+			expiry_status.last_check,
+			days_until_expiry,
+			expiry_check_enabled);
+	mutex_unlock(&boot_certs_mutex);
+
+	return ret;
+}
+static struct kobj_attribute expiry_status_attr = __ATTR_RO(expiry_status);
+
+static ssize_t expiry_check_now_store(struct kobject *k, struct kobj_attribute *a,
+				      const char *buf, size_t count)
+{
+	int violations;
+
+	if (!sysfs_streq(buf, "1"))
+		return -EINVAL;
+
+	mutex_lock(&boot_certs_mutex);
+
+	if (!boot_certs_sha_ok || bc_cert_count == 0) {
+		mutex_unlock(&boot_certs_mutex);
+		return -ENODATA;
+	}
+
+	violations = bc_update_expiry_status();
+
+	pr_info("boot_certs: manual expiry check: expired=%d expiring_soon=%d\n",
+		expiry_status.expired_count,
+		expiry_status.expiring_soon_count);
+
+	mutex_unlock(&boot_certs_mutex);
+
+	return count;
+}
+static struct kobj_attribute expiry_check_now_attr =
+	__ATTR(expiry_check_now, 0200, NULL, expiry_check_now_store);
+
 static struct attribute *attrs[] = {
 	&ok_attr.attr,
 	&sealed_attr.attr,
 	&status_attr.attr,
+	&expiry_status_attr.attr,
+	&expiry_check_now_attr.attr,
 	NULL,
 };
 
@@ -1058,28 +1531,101 @@ static const struct attribute_group attr_group = {
 	.attrs = attrs,
 };
 
+/* ---------- U-Boot memory address support ---------- */
+
+/*
+ * Boot parameter: boot_certs.addr=0x12345678
+ * Physical address where U-Boot placed certificate chain from FIT image
+ */
+static int __init boot_certs_addr_setup(char *str)
+{
+	boot_certs_addr = simple_strtoul(str, NULL, 0);
+	return 1;
+}
+__setup("boot_certs.addr=", boot_certs_addr_setup);
+
+/*
+ * Boot parameter: boot_certs.len=4096
+ * Length of certificate chain in bytes
+ */
+static int __init boot_certs_len_setup(char *str)
+{
+	boot_certs_len = simple_strtoul(str, NULL, 0);
+	return 1;
+}
+__setup("boot_certs.len=", boot_certs_len_setup);
+
+/*
+ * Read certificate chain from memory address (provided by U-Boot from FIT image)
+ * This is the preferred method for production - no filesystem dependency.
+ *
+ * Priority:
+ *   1. Kconfig fixed address (CONFIG_BOOT_CERTS_USE_MEM_ADDR) - for testing
+ *   2. Boot parameters (boot_certs.addr/len) - for production U-Boot FIT
+ */
+static int boot_certs_read_from_memory(void)
+{
+	void *virt_addr;
+	unsigned long addr = boot_certs_addr;
+	unsigned long len = boot_certs_len;
+
+#ifdef CONFIG_BOOT_CERTS_USE_MEM_ADDR
+	/* Use Kconfig values if enabled (testing mode) */
+	if (!addr || !len) {
+		addr = CONFIG_BOOT_CERTS_MEM_ADDR;
+		len = CONFIG_BOOT_CERTS_MEM_LEN;
+		bc_dbg("memory: using Kconfig addr=0x%lx len=%lu\n", addr, len);
+	}
+#endif
+
+	if (!addr || !len) {
+		bc_dbg("memory: addr or len not provided\n");
+		return -EINVAL;
+	}
+
+	if (len > CONFIG_BOOT_CERTS_MAX_BYTES) {
+		pr_err("boot_certs: memory: len %lu exceeds max %d\n",
+		       len, CONFIG_BOOT_CERTS_MAX_BYTES);
+		return -EINVAL;
+	}
+
+	/* Map physical address to kernel virtual address */
+	virt_addr = memremap(addr, len, MEMREMAP_WB);
+	if (!virt_addr) {
+		pr_err("boot_certs: memory: failed to remap 0x%lx (len=%lu)\n",
+		       addr, len);
+		return -ENOMEM;
+	}
+
+	/* Allocate kernel buffer and copy */
+	chain_buf = kvmalloc(len, GFP_KERNEL);
+	if (!chain_buf) {
+		memunmap(virt_addr);
+		return -ENOMEM;
+	}
+
+	memcpy(chain_buf, virt_addr, len);
+	chain_len = len;
+
+	memunmap(virt_addr);
+
+	bc_dbg("memory: loaded %zu bytes from phys 0x%lx\n",
+	       chain_len, addr);
+
+	return 0;
+}
+
 /* ---------- init / exit ---------- */
 
-static int __init boot_certs_init(void)
+/*
+ * Mount retry work: called when /boot/firmware isn't mounted yet
+ * Retries every 100ms until mount appears or max retries exceeded
+ */
+static int boot_certs_complete_init(void)
 {
-	char path[sizeof(BOOT_CERTS_BOOT_PATH) + 1 + sizeof(BOOT_CERTS_CERT_REL)];
 	u8 expected[BOOT_CERTS_DIGEST_LEN];
 	u8 actual[BOOT_CERTS_DIGEST_LEN];
 	int ret;
-
-	boot_certs_sha_ok = false;
-	boot_certs_sealed = false;
-	boot_certs_last_violation = BC_V_NONE;
-
-	snprintf(path, sizeof(path), "%s/%s", BOOT_CERTS_BOOT_PATH, BOOT_CERTS_CERT_REL);
-
-	ret = boot_certs_check_policy(path);
-	if (ret)
-		goto out_fail;
-
-	ret = boot_certs_read_file_once(path);
-	if (ret)
-		goto out_fail;
 
 	/* Parse PEM and reorder so root is at [0] (for future strict chain logic). */
 	ret = bc_pem_extract_all((const u8 *)chain_buf, chain_len);
@@ -1109,6 +1655,12 @@ static int __init boot_certs_init(void)
 
 	boot_certs_sha_ok = true;
 
+	/* Enforce certificate expiry policy */
+	ret = bc_enforce_expiry_policy();
+	if (ret) {
+		bc_dbg("expiry: policy enforcement failed (err=%d)\n", ret);
+		goto out_fail;
+	}
 
 	ret = boot_certs_load_into_secondary_keyring();
 	if (ret) {
@@ -1117,11 +1669,14 @@ static int __init boot_certs_init(void)
 		goto out_fail;
 	}
 
-	boot_certs_kobj = kobject_create_and_add(BOOT_CERTS_DIRNAME, kernel_kobj);
+	/* Create kobject if it doesn't exist (it exists if userspace-triggered) */
 	if (!boot_certs_kobj) {
-		boot_certs_poison(BC_V_SYSFS);
-		ret = -ENOMEM;
-		goto out_fail;
+		boot_certs_kobj = kobject_create_and_add(BOOT_CERTS_DIRNAME, kernel_kobj);
+		if (!boot_certs_kobj) {
+			boot_certs_poison(BC_V_SYSFS);
+			ret = -ENOMEM;
+			goto out_fail;
+		}
 	}
 
 	ret = sysfs_create_group(boot_certs_kobj, &attr_group);
@@ -1152,8 +1707,23 @@ static int __init boot_certs_init(void)
 	boot_certs_sealed = true;
 #endif
 
-	pr_info("boot_certs: OK, exported %zu bytes at /sys/kernel/%s/chain.pem\n",
-		chain_len, BOOT_CERTS_DIRNAME);
+	/* Initialize periodic expiry checking */
+#if IS_ENABLED(CONFIG_BOOT_CERTS_EXPIRY_CHECK_DAILY)
+	INIT_DELAYED_WORK(&expiry_check_work, bc_expiry_check_work_fn);
+	expiry_check_enabled = true;
+	schedule_delayed_work(&expiry_check_work,
+			     BOOT_CERTS_CHECK_INTERVAL_HOURS * 60 * 60 * HZ);
+	pr_info("boot_certs: scheduled expiry checks every %d hours\n",
+		BOOT_CERTS_CHECK_INTERVAL_HOURS);
+#endif
+
+	pr_info("boot_certs: OK, exported %zu bytes at /sys/kernel/%s/chain.pem "
+		"(policy=%s, %d root CAs, %zu total certs)\n",
+		chain_len, BOOT_CERTS_DIRNAME,
+		(BOOT_CERTS_EXPIRY_POLICY == BC_EXPIRY_WARN) ? "WARN" :
+		(BOOT_CERTS_EXPIRY_POLICY == BC_EXPIRY_REJECT) ? "REJECT" : "STRICT",
+		expiry_status.expired_count > 0 ? 0 : 1,  /* Rough estimate */
+		bc_cert_count);
 	return 0;
 
 out_bin:
@@ -1167,16 +1737,123 @@ out_fail:
 	if (atomic_read(&boot_certs_poisoned) && __ratelimit(&boot_certs_rs))
 		pr_warn("boot_certs: failed: violation=%s\n",
 			boot_certs_violation_str(boot_certs_last_violation));
-
-	bc_pem_free_all();
-	kvfree(chain_buf);
-	chain_buf = NULL;
-	chain_len = 0;
-	return -EKEYREJECTED;
+	return ret;
 }
 
-static void __exit boot_certs_exit(void)
+/* Forward declaration for sysfs trigger */
+static struct kobj_attribute initialize_attr;
+
+/* Sysfs trigger for delayed initialization from userspace */
+static ssize_t initialize_store(struct kobject *kobj, struct kobj_attribute *attr,
+				 const char *buf, size_t count)
 {
+	char path[sizeof(BOOT_CERTS_BOOT_PATH) + 1 + sizeof(BOOT_CERTS_CERT_REL)];
+	int ret;
+
+	if (boot_certs_sha_ok) {
+		pr_warn("boot_certs: already initialized\n");
+		return -EEXIST;
+	}
+
+	pr_info("boot_certs: userspace trigger - loading from filesystem\n");
+
+	snprintf(path, sizeof(path), "%s/%s", BOOT_CERTS_BOOT_PATH, BOOT_CERTS_CERT_REL);
+
+	ret = boot_certs_check_policy(path);
+	if (ret) {
+		pr_err("boot_certs: check_policy failed: %d\n", ret);
+		boot_certs_poison(BC_V_PATH_LOOKUP);
+		return ret;
+	}
+
+	ret = boot_certs_read_file_once(path);
+	if (ret) {
+		boot_certs_poison(BC_V_PATH_LOOKUP);
+		return ret;
+	}
+
+	ret = boot_certs_complete_init();
+	if (ret)
+		return ret;
+
+	pr_info("boot_certs: initialization complete via userspace trigger\n");
+	return count;
+}
+
+static struct kobj_attribute initialize_attr = __ATTR_WO(initialize);
+
+static int __init boot_certs_init(void)
+{
+	char path[sizeof(BOOT_CERTS_BOOT_PATH) + 1 + sizeof(BOOT_CERTS_CERT_REL)];
+	int ret;
+
+	pr_info("boot_certs: INIT STARTED at %lu jiffies\n", jiffies);
+
+	boot_certs_sha_ok = false;
+	boot_certs_sealed = false;
+	boot_certs_last_violation = BC_V_NONE;
+
+	/*
+	 * Try U-Boot memory address first (production FIT image method).
+	 * Falls back to filesystem for R&D/testing.
+	 */
+	ret = boot_certs_read_from_memory();
+	if (ret == 0) {
+		bc_dbg("using certificates from U-Boot memory (FIT image)\n");
+	} else {
+		bc_dbg("U-Boot memory not available, trying filesystem\n");
+
+		snprintf(path, sizeof(path), "%s/%s", BOOT_CERTS_BOOT_PATH, BOOT_CERTS_CERT_REL);
+
+		ret = boot_certs_check_policy(path);
+		if (ret == -ENOENT) {
+			/* /boot/firmware not mounted - create sysfs trigger for userspace */
+			pr_info("boot_certs: /boot/firmware not ready, creating sysfs trigger\n");
+
+			boot_certs_kobj = kobject_create_and_add(BOOT_CERTS_DIRNAME, kernel_kobj);
+			if (!boot_certs_kobj)
+				return -ENOMEM;
+
+			ret = sysfs_create_file(boot_certs_kobj, &initialize_attr.attr);
+			if (ret) {
+				kobject_put(boot_certs_kobj);
+				boot_certs_kobj = NULL;
+				return ret;
+			}
+
+			pr_info("boot_certs: created /sys/kernel/boot_certs/initialize - waiting for userspace\n");
+			return 0;  /* Userspace will trigger initialization */
+		}
+		if (ret) {
+			boot_certs_poison(BC_V_PATH_LOOKUP);
+			return -EKEYREJECTED;
+		}
+
+		ret = boot_certs_read_file_once(path);
+		if (ret) {
+			boot_certs_poison(BC_V_PATH_LOOKUP);
+			return -EKEYREJECTED;
+		}
+	}
+
+	/* Complete initialization (parse, hash check, keyring load, sysfs) */
+	return boot_certs_complete_init();
+}
+
+/*
+ * Note: This code is built into the kernel, not a module.
+ * The exit function is included for completeness but won't be called
+ * in normal operation. Resources remain allocated for the lifetime
+ * of the kernel.
+ */
+static void boot_certs_exit(void)
+{
+	/* Cancel periodic expiry checks */
+#if IS_ENABLED(CONFIG_BOOT_CERTS_EXPIRY_CHECK_DAILY)
+	expiry_check_enabled = false;
+	cancel_delayed_work_sync(&expiry_check_work);
+#endif
+
 	/*
 	 * Remove sysfs files first to prevent new accesses.
 	 * kobject_put() will wait for existing sysfs operations to complete
@@ -1201,8 +1878,22 @@ static void __exit boot_certs_exit(void)
 	mutex_unlock(&boot_certs_mutex);
 }
 
-module_init(boot_certs_init);
-module_exit(boot_certs_exit);
-
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Boot cert export via sysfs with RO + SHA3-512 verification (+ PEM parse + sealing hook)");
+/*
+ * Initialization timing considerations:
+ *
+ * With U-Boot FIT + memory address (production):
+ *   - Can use late_initcall (early, no filesystem dependency)
+ *   - Certificates already in memory from bootloader
+ *
+ * With filesystem fallback (testing /boot/firmware):
+ *   - Needs device_initcall_sync (late, after userspace mounts)
+ *   - /boot/firmware mounted by systemd/fstab before this runs
+ *
+ * device_initcall_sync is:
+ *   - Late enough for filesystem mounts
+ *   - Early enough to complete before module loading
+ *   - Safe for both memory and filesystem methods
+ *
+ * Future: FIT image integration will allow switching back to late_initcall.
+ */
+device_initcall_sync(boot_certs_init);

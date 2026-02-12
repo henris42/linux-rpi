@@ -51,6 +51,12 @@ int restrict_link_by_digsig_builtin_and_secondary(struct key *keyring,
 						  const union key_payload *payload,
 						  struct key *restriction_key);
 void __init add_to_secondary_keyring(const char *source, const void *data, size_t len);
+
+#ifdef CONFIG_BOOT_CERTS_SYSFS
+extern int boot_root_certs_add_cert(const void *der, size_t der_len,
+				    const char *desc);
+#endif
+
 #else
 #define restrict_link_by_builtin_and_secondary_trusted restrict_link_by_builtin_trusted
 #define restrict_link_by_digsig_builtin_and_secondary restrict_link_by_digsig_builtin
