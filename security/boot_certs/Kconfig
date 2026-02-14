@@ -144,3 +144,26 @@ config BOOT_CERTS_EXPIRY_CHECK_INTERVAL
 	  Default is 24 hours (daily check).
 	  Minimum 1 hour, maximum 168 hours (1 week).
 
+config BOOT_CERTS_CRL
+	bool "Runtime certificate revocation list (CRL) support"
+	depends on BOOT_CERTS_SYSFS
+	depends on SYSTEM_DATA_VERIFICATION
+	depends on PKCS7_MESSAGE_PARSER
+	depends on CRYPTO_SHA256
+	help
+	  Enable runtime certificate revocation via a sysfs endpoint.
+	  A PKCS#7-signed CRL binary payload can be pushed to
+	  /sys/kernel/crl/push_crl to immediately revoke certificates
+	  in all trusted keyrings.
+
+	  The CRL must be signed by a key that chains back to a trusted
+	  root in the secondary (or builtin) trusted keyring. Upon
+	  processing, matching certificates and all their leaf
+	  certificates are invalidated immediately via cascade
+	  revocation.
+
+	  Replay protection is enforced via monotonic timestamps.
+	  Requires CAP_SYS_ADMIN to push a CRL.
+
+	  If unsure, say N.
+

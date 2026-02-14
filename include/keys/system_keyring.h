@@ -19,6 +19,8 @@ enum blacklist_hash_type {
 
 #ifdef CONFIG_SYSTEM_TRUSTED_KEYRING
 
+extern struct key *get_builtin_trusted_keys(void);
+
 extern int restrict_link_by_builtin_trusted(struct key *keyring,
 					    const struct key_type *type,
 					    const union key_payload *payload,
@@ -33,6 +35,7 @@ extern __init int load_module_cert(struct key *keyring);
 #define restrict_link_by_builtin_trusted restrict_link_reject
 #define restrict_link_by_digsig_builtin restrict_link_reject
 
+static inline struct key *get_builtin_trusted_keys(void) { return NULL; }
 static inline __init int load_module_cert(struct key *keyring)
 {
 	return 0;
@@ -41,6 +44,8 @@ static inline __init int load_module_cert(struct key *keyring)
 #endif
 
 #ifdef CONFIG_SECONDARY_TRUSTED_KEYRING
+extern struct key *get_secondary_trusted_keys(void);
+
 extern int restrict_link_by_builtin_and_secondary_trusted(
 	struct key *keyring,
 	const struct key_type *type,
@@ -53,13 +58,17 @@ int restrict_link_by_digsig_builtin_and_secondary(struct key *keyring,
 void __init add_to_secondary_keyring(const char *source, const void *data, size_t len);
 
 #ifdef CONFIG_BOOT_CERTS_SYSFS
+extern struct key *get_boot_root_certs(void);
 extern int boot_root_certs_add_cert(const void *der, size_t der_len,
 				    const char *desc);
+#else
+static inline struct key *get_boot_root_certs(void) { return NULL; }
 #endif
 
 #else
 #define restrict_link_by_builtin_and_secondary_trusted restrict_link_by_builtin_trusted
 #define restrict_link_by_digsig_builtin_and_secondary restrict_link_by_digsig_builtin
+static inline struct key *get_secondary_trusted_keys(void) { return NULL; }
 static inline void __init add_to_secondary_keyring(const char *source, const void *data, size_t len)
 {
 }

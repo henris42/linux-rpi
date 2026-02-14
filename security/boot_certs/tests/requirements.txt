@@ -1,0 +1,22 @@
+# Boot Certificate Test Suite - Requirements
+# Install: pip3 install -r requirements.txt
+
+# Testing framework
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-timeout>=2.1.0
+
+# Certificate generation and handling
+cryptography>=41.0.0
+python-dateutil>=2.8.0
+
+# HTTP client for future REST API tests
+requests>=2.31.0
+requests-mock>=1.11.0
+
+# EST (Enrollment over Secure Transport) - future
+# estclient>=0.3.0  # Uncomment when implementing EST
+
+# Utilities
+pyyaml>=6.0
+click>=8.1.0

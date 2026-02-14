@@ -21,8 +21,21 @@
 #include <crypto/pkcs7.h>
 
 static struct key *builtin_trusted_keys;
+
+struct key *get_builtin_trusted_keys(void)
+{
+	return builtin_trusted_keys;
+}
+EXPORT_SYMBOL_GPL(get_builtin_trusted_keys);
+
 #ifdef CONFIG_SECONDARY_TRUSTED_KEYRING
 static struct key *secondary_trusted_keys;
+
+struct key *get_secondary_trusted_keys(void)
+{
+	return secondary_trusted_keys;
+}
+EXPORT_SYMBOL_GPL(get_secondary_trusted_keys);
 #endif
 #ifdef CONFIG_INTEGRITY_MACHINE_KEYRING
 static struct key *machine_trusted_keys;
@@ -32,6 +45,12 @@ static struct key *platform_trusted_keys;
 #endif
 #ifdef CONFIG_BOOT_CERTS_SYSFS
 static struct key *boot_root_certs;
+
+struct key *get_boot_root_certs(void)
+{
+	return boot_root_certs;
+}
+EXPORT_SYMBOL_GPL(get_boot_root_certs);
 #endif
 
 extern __initconst const u8 system_certificate_list[];
