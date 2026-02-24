@@ -256,8 +256,9 @@ static int revoke_single_entry(struct crl_context *ctx,
 
 struct cascade_ctx {
 	struct list_head	*revoked;
-	struct key		*collected[CRL_CASCADE_MAX_COLLECT];
+	struct key		**collected;	/* dynamically allocated */
 	int			count;
+	int			max;
 };
 
 static int cascade_iterator(const void *object, void *data)
@@ -287,7 +288,7 @@ static int cascade_iterator(const void *object, void *data)
 			 asymmetric_key_id_same(ri->id_1, sig->auth_ids[1]))
 			match = true;
 
-		if (match && ctx->count < CRL_CASCADE_MAX_COLLECT) {
+		if (match && ctx->count < ctx->max) {
 			key_get(key);
 			ctx->collected[ctx->count++] = key;
 			return 0;
@@ -304,6 +305,12 @@ static int cascade_revoke_keyring(struct key *keyring,
 		.count = 0,
 	};
 	int i, new_revocations = 0;
+
+	ctx.collected = kcalloc(CRL_CASCADE_MAX_COLLECT, sizeof(struct key *),
+				GFP_KERNEL);
+	if (!ctx.collected)
+		return 0;
+	ctx.max = CRL_CASCADE_MAX_COLLECT;
 
 	down_read(&keyring->sem);
 	assoc_array_iterate(&keyring->keys, cascade_iterator, &ctx);
@@ -326,6 +333,7 @@ static int cascade_revoke_keyring(struct key *keyring,
 		total_revoked++;
 	}
 
+	kfree(ctx.collected);
 	return new_revocations;
 }
 
