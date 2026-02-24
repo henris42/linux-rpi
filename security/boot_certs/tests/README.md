@@ -1,26 +1,16 @@
 # Boot Certificate System - Test Suite
 
-Comprehensive test suite for the boot certificate validation system, including certificate generation, expiry enforcement, and hierarchical keyring sealing.
+Test suite for the boot certificate validation and module signing system,
+covering certificate generation, expiry enforcement, hierarchical keyring
+sealing, and both ECC and FALCON-1024 module signing.
 
 ## Features
 
-✅ **Unit Tests**
-- Certificate generation and validation
-- Expiry detection logic
-- Hash calculation
-- Policy enforcement logic
-
-✅ **Integration Tests**
-- Kernel module sysfs interface
-- Keyring structure validation
-- Hierarchical sealing verification
-- Runtime certificate addition
-
-✅ **Future: EST/REST Integration**
-- Certificate signing via EST protocol
-- Short-term certificates for expiry testing
-- Temporary intermediate CA generation
-- Automated certificate rotation
+- **Certificate Tests** - Generation, expiry detection, policy logic
+- **ECC Module Signing** - Build, sign (sha3-512), load, reject unsigned
+- **FALCON Module Signing** - Sign (falcon-1024), load, verify PQC works
+- **Kernel Integration** - sysfs interface, keyring structure, sealing
+- **EST/REST** - Stubs for future CA service (skipped by default)
 
 ## Quick Start
 
@@ -41,142 +31,103 @@ pip install -r requirements.txt
 
 **Note:** The `run_tests.sh` script automatically activates the virtual environment if it exists.
 
-### 2. Run Unit Tests (No kernel module required)
+### 2. Run Tests
 
 ```bash
-# Run all unit tests
+# Unit tests only (no root required)
 ./run_tests.sh
 
-# Or use pytest directly (after activating venv)
-source venv/bin/activate
-pytest test_boot_certs.py -v
+# All tests including module signing load tests (requires root)
+sudo venv/bin/python -m pytest test_boot_certs.py -v
+
+# Signing tests only
+sudo pytest test_boot_certs.py -m signing -v
+
+# Kernel integration only
+sudo pytest test_boot_certs.py -m kernel -v
 ```
 
-**Expected output:**
+**Expected output (as root):**
 ```
-===================== 11 passed, 4 skipped in 0.5s =====================
+28 passed, 6 skipped in 5.5s
 ```
-
-### 3. Run Integration Tests (Requires root + loaded module)
-
-**IMPORTANT:** Integration tests require the NEW kernel module with expiry features. If you're running the old module version, some tests will fail (expiry_status sysfs file won't exist).
-
-```bash
-# First, rebuild and load the NEW kernel module
-cd /home/hs/linux-rpi
-make -j$(nproc)
-make modules
-cd security/boot_certs
-sudo rmmod boot_certs_sysfs  # Remove old module if loaded
-sudo insmod boot_certs_sysfs.ko
-
-# Run all tests
-cd tests
-sudo ./run_tests.sh --all
-
-# Or just kernel integration tests
-sudo ./run_tests.sh --kernel
-```
-
-**Expected output with NEW module:**
-```
-===================== 18 passed in 0.8s =====================
-```
-
-**Expected output with OLD module:**
-```
-=========== 2 failed, 14 passed, 7 skipped in 0.8s ===========
-```
-(Failures: `test_sysfs_interface_exists`, `test_read_expiry_status` - expiry features not in old module)
 
 ## Test Structure
 
 ```
 tests/
-├── test_boot_certs.py           # Main test suite
-├── est_rest_service_stub.py     # Future EST/REST service
-├── run_tests.sh                 # Test runner script
-├── requirements.txt             # Python dependencies
-├── pytest.ini                   # Pytest configuration
-├── README.md                    # This file
-└── output/                      # Test artifacts (created during tests)
-    ├── valid_root_ca.pem
-    ├── test_chain.pem
-    └── chain_hash.txt
+├── test_boot_certs.py         # Main test suite (34 tests)
+├── pytest.ini                 # Pytest markers and config
+├── requirements.txt           # Python dependencies
+├── run_tests.sh               # Convenience runner script
+├── hello-test/                # Test kernel module
+│   ├── hello.c                #   Simple hello_kmod source
+│   └── Makefile               #   Build against running kernel
+├── module_signing_ecdsa.pem   # ECC private key (PKCS#8)
+├── module_signing_ecdsa.x509  # ECC signing certificate (PEM)
+├── falcon_private.key         # FALCON-1024 private key
+├── falcon.pem                 # FALCON-1024 signing certificate
+├── est_rest_service_stub.py   # Future EST/REST service stub
+├── output/                    # Generated test artifacts
+└── venv/                      # Python virtual environment
 ```
 
 ## Test Categories
 
-### Unit Tests (No special privileges required)
+### Unit Tests (no root required)
 
-**Certificate Generation:**
-```bash
-pytest test_boot_certs.py::TestCertificateGeneration -v
-```
-- Test root CA generation
-- Test intermediate CA generation
-- Test certificate chain creation
-- Test expiry date handling
+| Class | Tests | What it covers |
+|-------|-------|----------------|
+| `TestCertificateGeneration` | 5 | Root/intermediate/expired cert creation, SHA3-512 |
+| `TestExpiryDetection` | 6 | WARN/REJECT/STRICT policy logic |
 
-**Expiry Detection:**
-```bash
-pytest test_boot_certs.py::TestExpiryDetection -v
-```
-- Test valid certificate detection
-- Test expired certificate detection
-- Test expiring-soon detection
-- Test policy logic (WARN/REJECT/STRICT)
+### Module Signing Tests (`@pytest.mark.signing`)
 
-### Integration Tests (Requires root + loaded module)
+| Class | Tests | What it covers |
+|-------|-------|----------------|
+| `TestECCSigning` | 6 | Build hello.ko, sign sha3-512, load, reject unsigned |
+| `TestFalconSigning` | 5 | Sign falcon-1024, load PQC module, size comparison |
 
-**Kernel Module:**
-```bash
-sudo pytest test_boot_certs.py::TestKernelModule -v -m kernel
-```
-- Sysfs interface availability
-- Status reading
-- Manual expiry checks
-- Keyring structure
+Loading tests require root. Signing-only tests work without root.
 
-**Hierarchical Sealing:**
-```bash
-sudo pytest test_boot_certs.py::TestHierarchicalSealing -v -m kernel
-```
-- Block new root CAs
-- Block unsigned certificates
-- Allow intermediate CAs signed by roots
+### Kernel Integration Tests (`@pytest.mark.kernel`)
+
+| Class | Tests | What it covers |
+|-------|-------|----------------|
+| `TestKernelModule` | 6 | sysfs files, status, expiry, keyrings |
+| `TestHierarchicalSealing` | 2 | Block rogue roots, block unsigned certs |
+
+### EST/REST Tests (`@pytest.mark.est`, skipped)
+
+| Class | Tests | What it covers |
+|-------|-------|----------------|
+| `TestESTRESTIntegration` | 4 | Future CA service (all skipped) |
 
 ## Running Specific Tests
 
 ```bash
-# Run tests by name pattern
-pytest test_boot_certs.py -k test_expiry -v
+# By marker
+pytest -m signing -v                    # All signing tests
+pytest -m kernel -v                     # All kernel integration
+pytest -m "not kernel" -v               # Skip kernel tests
 
-# Run tests by marker
-pytest test_boot_certs.py -m kernel -v
-pytest test_boot_certs.py -m "not kernel" -v
+# By class
+pytest test_boot_certs.py::TestFalconSigning -v
+pytest test_boot_certs.py::TestECCSigning -v
 
-# Run with coverage
+# By name pattern
+pytest -k test_expiry -v
+pytest -k "falcon and load" -v
+
+# With coverage
 ./run_tests.sh --coverage
-
-# Generate HTML coverage report
-pytest --cov=. --cov-report=html
-# View: firefox htmlcov/index.html
 ```
 
 ## Test Markers
 
-Tests are marked for selective execution:
-
-- `@pytest.mark.kernel` - Requires loaded kernel module
-- `@pytest.mark.slow` - Slow-running tests
-- `@pytest.mark.est` - Requires EST service (future)
-- `@pytest.mark.rest` - Requires REST API (future)
-
-Example: Skip kernel tests
-```bash
-pytest -m "not kernel" -v
-```
+- `@pytest.mark.signing` - Module signing tests (ECC + FALCON)
+- `@pytest.mark.kernel` - Kernel integration (requires boot_certs active)
+- `@pytest.mark.est` - EST service tests (skipped, future)
 
 ## Test Fixtures
 
