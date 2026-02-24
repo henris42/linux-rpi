@@ -100,9 +100,14 @@ static inline void shake256_inc_squeeze(uint8_t *out, size_t len, shake256incctx
 	unsigned int done = 0;
 
 	while (len > 0) {
-		unsigned int available = SHAKE256_RATE - (sc->squeezed % SHAKE256_RATE);
-		unsigned int todo = (len < available) ? len : available;
 		unsigned int offset = sc->squeezed % SHAKE256_RATE;
+
+		/* If we've consumed a full block, permute for the next one */
+		if (offset == 0 && sc->squeezed > 0)
+			crypto_sha3_permute(sc->state.st);
+
+		unsigned int available = SHAKE256_RATE - offset;
+		unsigned int todo = (len < available) ? len : available;
 
 		/* Copy from state */
 		memcpy(out + done, ((u8 *)sc->state.st) + offset, todo);
@@ -110,10 +115,6 @@ static inline void shake256_inc_squeeze(uint8_t *out, size_t len, shake256incctx
 		done += todo;
 		len -= todo;
 		sc->squeezed += todo;
-
-		/* Need more output? Permute again */
-		if (len > 0 && (sc->squeezed % SHAKE256_RATE) == 0)
-			crypto_sha3_permute(sc->state.st);
 	}
 }
 
