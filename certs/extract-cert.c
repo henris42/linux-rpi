@@ -131,6 +131,12 @@ int main(int argc, char **argv)
 	ERR_load_crypto_strings();
 	ERR_clear_error();
 
+#if OPENSSL_VERSION_MAJOR >= 3
+	/* Load OQS provider for PQC certificate support (FALCON, etc.) */
+	if (OSSL_PROVIDER_try_load(NULL, "oqsprovider", true))
+		OSSL_PROVIDER_try_load(NULL, "default", true);
+#endif
+
 	verbose_env = getenv("KBUILD_VERBOSE");
 	if (verbose_env && strchr(verbose_env, '1'))
 		verbose = true;
