@@ -1717,13 +1717,19 @@ static int boot_certs_complete_init(void)
 		BOOT_CERTS_CHECK_INTERVAL_HOURS);
 #endif
 
-	pr_info("boot_certs: OK, exported %zu bytes at /sys/kernel/%s/chain.pem "
-		"(policy=%s, %d root CAs, %zu total certs)\n",
-		chain_len, BOOT_CERTS_DIRNAME,
-		(BOOT_CERTS_EXPIRY_POLICY == BC_EXPIRY_WARN) ? "WARN" :
-		(BOOT_CERTS_EXPIRY_POLICY == BC_EXPIRY_REJECT) ? "REJECT" : "STRICT",
-		expiry_status.expired_count > 0 ? 0 : 1,  /* Rough estimate */
-		bc_cert_count);
+	{
+		int rc = 0;
+		size_t ci;
+		for (ci = 0; ci < bc_cert_count; ci++)
+			if (bc_is_root_ca(ci))
+				rc++;
+		pr_info("boot_certs: OK, exported %zu bytes at /sys/kernel/%s/chain.pem "
+			"(policy=%s, %d root CAs, %zu total certs)\n",
+			chain_len, BOOT_CERTS_DIRNAME,
+			(BOOT_CERTS_EXPIRY_POLICY == BC_EXPIRY_WARN) ? "WARN" :
+			(BOOT_CERTS_EXPIRY_POLICY == BC_EXPIRY_REJECT) ? "REJECT" : "STRICT",
+			rc, bc_cert_count);
+	}
 	return 0;
 
 out_bin:
