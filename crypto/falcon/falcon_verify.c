@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * FALCON post-quantum signature verification
- * Kernel crypto API integration (STUB - work in progress)
+ * Kernel crypto API integration
  *
  * Based on PQClean reference implementation
  * https://github.com/PQClean/PQClean
@@ -15,6 +15,7 @@
 #include <crypto/internal/akcipher.h>
 
 #include "api.h"
+#include "inner.h"
 
 /*
  * FALCON context for kernel crypto API
@@ -70,60 +71,53 @@ static int falcon_verify(struct akcipher_request *req)
 {
 	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
 	struct falcon_ctx *ctx = akcipher_tfm_ctx(tfm);
-	unsigned char *sig_buf = NULL;
-	unsigned char *msg_buf = NULL;
-	unsigned int sig_len, msg_len;
+	unsigned char *buffer = NULL;
+	unsigned int sig_len, msg_len, total_len;
 	int ret;
 
 	/* Ensure public key is set */
 	if (!ctx->pub_key_set)
 		return -EINVAL;
 
-	/* Get lengths from request */
+	/*
+	 * akcipher verify convention: req->src contains [signature || message]
+	 * concatenated in a single scatterlist. req->dst is NULL.
+	 * req->src_len = signature length, req->dst_len = message length.
+	 */
 	sig_len = req->src_len;
 	msg_len = req->dst_len;
+	total_len = sig_len + msg_len;
 
-	/* Validate signature length bounds */
-	if (ctx->logn == 9 && sig_len > 690)
-		return -EINVAL;  /* FALCON-512 max */
-	if (ctx->logn == 10 && sig_len > 1280)
-		return -EINVAL;  /* FALCON-1024 max */
+	/* Validate signature length bounds (CRYPTO_BYTES includes header+nonce) */
+	if (ctx->logn == 9 && sig_len > FALCON512_CRYPTO_BYTES)
+		return -EINVAL;
+	if (ctx->logn == 10 && sig_len > FALCON1024_CRYPTO_BYTES)
+		return -EINVAL;
 
-	/* Allocate buffers for signature and message */
-	sig_buf = kmalloc(sig_len, GFP_KERNEL);
-	if (!sig_buf)
+	/* Allocate buffer for combined signature + message */
+	buffer = kmalloc(total_len, GFP_KERNEL);
+	if (!buffer)
 		return -ENOMEM;
 
-	msg_buf = kmalloc(msg_len, GFP_KERNEL);
-	if (!msg_buf) {
-		kfree(sig_buf);
-		return -ENOMEM;
-	}
+	/* Extract both signature and message from req->src scatterlist */
+	sg_pcopy_to_buffer(req->src,
+			   sg_nents_for_len(req->src, total_len),
+			   buffer, total_len, 0);
 
-	/* Extract signature from scatterlist */
-	sg_copy_to_buffer(req->src, sg_nents_for_len(req->src, sig_len),
-			  sig_buf, sig_len);
-
-	/* Extract message from scatterlist */
-	sg_copy_to_buffer(req->dst, sg_nents_for_len(req->dst, msg_len),
-			  msg_buf, msg_len);
-
-	/* Call FALCON verification
+	/* Call FALCON verification with correct parameter set
 	 * Returns 0 on success, -1 on verification failure */
-	ret = PQCLEAN_FALCON512_CLEAN_crypto_sign_verify(
-		sig_buf, sig_len,
-		msg_buf, msg_len,
-		ctx->public_key);
+	ret = falcon_crypto_sign_verify(
+		buffer, sig_len,
+		buffer + sig_len, msg_len,
+		ctx->public_key, ctx->logn);
 
-	/* Clean up buffers */
-	kfree(sig_buf);
-	kfree(msg_buf);
+	kfree(buffer);
 
 	/* Convert FALCON return code to kernel error code */
 	if (ret != 0)
-		return -EKEYREJECTED;  /* Signature verification failed */
+		return -EKEYREJECTED;
 
-	return 0;  /* Success */
+	return 0;
 }
 
 /*
@@ -133,11 +127,11 @@ static unsigned int falcon_max_size(struct crypto_akcipher *tfm)
 {
 	struct falcon_ctx *ctx = akcipher_tfm_ctx(tfm);
 
-	/* Maximum compressed signature size */
+	/* Maximum signature size (header + nonce + compressed sig) */
 	if (ctx->logn == 9)
-		return 690;   /* FALCON-512 */
+		return FALCON512_CRYPTO_BYTES;
 	else
-		return 1280;  /* FALCON-1024 */
+		return FALCON1024_CRYPTO_BYTES;
 }
 
 /*
@@ -189,9 +183,42 @@ static struct akcipher_alg falcon1024_alg = {
 	},
 };
 
+static void __init falcon_shake256_selftest(void)
+{
+	/*
+	 * SHAKE256("") known answer test.
+	 * Expected first 16 bytes:
+	 * 46b9dd2b0ba88d13233b3feb743eeb24
+	 */
+	static const u8 expected[16] = {
+		0x46, 0xb9, 0xdd, 0x2b, 0x0b, 0xa8, 0x8d, 0x13,
+		0x23, 0x3b, 0x3f, 0xeb, 0x74, 0x3e, 0xeb, 0x24
+	};
+	inner_shake256_context sc;
+	u8 out[16];
+
+	inner_shake256_init(&sc);
+	inner_shake256_flip(&sc);
+	inner_shake256_extract(&sc, out, 16);
+	inner_shake256_ctx_release(&sc);
+
+	if (memcmp(out, expected, 16) == 0)
+		pr_info("falcon: SHAKE256 self-test PASSED\n");
+	else
+		pr_err("falcon: SHAKE256 self-test FAILED: "
+		       "%02x%02x%02x%02x%02x%02x%02x%02x"
+		       "%02x%02x%02x%02x%02x%02x%02x%02x\n",
+		       out[0], out[1], out[2], out[3],
+		       out[4], out[5], out[6], out[7],
+		       out[8], out[9], out[10], out[11],
+		       out[12], out[13], out[14], out[15]);
+}
+
 static int __init falcon_init(void)
 {
 	int ret;
+
+	falcon_shake256_selftest();
 
 	ret = crypto_register_akcipher(&falcon512_alg);
 	if (ret) {
