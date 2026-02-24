@@ -259,6 +259,21 @@ dmesg | grep boot_certs
 # - Expired certificates (in REJECT/STRICT mode)
 ```
 
+## Openssl changes
+PQ provider needs to be added, see https://github.com/henris42/oqs-provider/tree/falcon1024old-oid
+Also add to openssl config (ie /etc/ssl/openssl.cnf):
+```
+# List of providers to load
+[provider_sect]
+oqsprovider = oqsprovider_sect
+default = default_sect
+[default_sect]
+activate = 1
+[oqsprovider_sect]
+activate = 1
+
+```
+
 ## Support
 
 For issues, check:
