@@ -142,9 +142,9 @@ enum OID {
 	 */
 #ifdef CONFIG_CRYPTO_FALCON
 	OID_falcon512,				/* 1.3.9999.3.6 */
-	OID_falcon1024,				/* 1.3.9999.3.8 */
-	OID_falcon_padded512,			/* 1.3.9999.3.9 */
-	OID_falcon_padded1024,			/* 1.3.9999.3.11 */
+	OID_falcon1024,				/* 1.3.9999.3.9 */
+	OID_falcon_padded512,			/* 1.3.9999.3.11 */
+	OID_falcon_padded1024,			/* 1.3.9999.3.14 */
 #endif
 
 	/* CSOR FIPS-202 SHA-3 */
